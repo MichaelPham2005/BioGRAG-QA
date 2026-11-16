@@ -57,21 +57,33 @@ rather than deleting it or cloning over it.
 
 ```python
 import shutil
+import subprocess
 import sys
+from pathlib import Path
 
-if shutil.which("uv") is None:
-    subprocess.run([sys.executable, "-m", "pip", "install", "uv"], check=True)
+UV = shutil.which("uv")
+if UV is None:
+    tools = Path("/kaggle/working/grag-tools")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--target", str(tools), "uv"],
+        check=True,
+    )
+    UV = str(tools / "bin" / "uv")
+    if not Path(UV).is_file():
+        raise FileNotFoundError(f"uv installation did not create {UV}")
+
+subprocess.run([UV, "--version"], check=True)
 
 ENV = Path("/kaggle/working/grag-venv")
 PY = str(ENV / "bin/python")
 subprocess.run(
-    [sys.executable, "-m", "uv", "venv", "--python", "3.10", str(ENV)],
+    [UV, "venv", "--python", "3.10", str(ENV)],
     check=True,
 )
 
 def install(*args):
     subprocess.run(
-        [sys.executable, "-m", "uv", "pip", "install", "--python", PY, *args],
+        [UV, "pip", "install", "--python", PY, *args],
         cwd=ROOT, check=True,
     )
 
@@ -83,12 +95,23 @@ install(
     "--only-binary", "torch-scatter",
 )
 subprocess.run(
-    [sys.executable, "-m", "uv", "pip", "check", "--python", PY], check=True
+    [UV, "pip", "check", "--python", PY], check=True
 )
 
 def run(code):
     subprocess.run([PY, "-u", "-c", code], cwd=ROOT, check=True)
 ```
+
+Use the resolved `UV` executable throughout, not `sys.executable -m uv`.
+Kaggle may have `uv` on `PATH` without the `uv` Python module being installed
+in the notebook kernel's interpreter. If the executable is missing, the cell
+installs it into the writable `/kaggle/working/grag-tools` directory rather
+than modifying the system Python environment.
+
+The IPython warning `History will not be written to the database` is separate:
+it concerns notebook input-history storage, not the GRAG environment or dataset.
+It does not explain `No module named uv`. If it persists, save the notebook and
+restart the Kaggle session; do not change permissions on shared system files.
 
 This installs the `torch_scatter` extension actually imported by
 [GraphLLM](../../src/model/graph_llm.py#L6). The original requirements also list
@@ -221,6 +244,64 @@ utilities and [loads SentenceBERT at module scope](../../src/utils/graph_retriev
 Even Stage A can therefore download/load the encoder. This is existing code
 behavior, not a requirement of CSV construction itself.
 
+#### Optional: chart average nodes/edges per query
+
+Run after Stage A, in the notebook itself (not through `run()`), so it uses
+the absolute `ROOT` path. It reads only the CSVs (no SBERT, no GPU) and saves a
+figure plus a summary table to `dataset/webqsp/stats/`.
+
+```python
+import glob, os
+import pandas as pd
+import matplotlib.pyplot as plt
+
+root = str(ROOT / "dataset/webqsp")  # ROOT from the clone cell; notebook cwd is not the repo
+n = len(glob.glob(f"{root}/nodes/*.csv"))
+split = {}
+for name in ["train", "val", "test"]:
+    with open(f"{root}/split/{name}_indices.txt") as f:
+        for line in f:
+            if line.strip():
+                split[int(line)] = name
+
+def count(path):
+    try:
+        return len(pd.read_csv(path))
+    except pd.errors.EmptyDataError:
+        return 0
+
+df = pd.DataFrame({
+    "idx": range(n),
+    "nodes": [count(f"{root}/nodes/{i}.csv") for i in range(n)],
+    "edges": [count(f"{root}/edges/{i}.csv") for i in range(n)],
+})
+df["split"] = df["idx"].map(split)
+
+summary = df.groupby("split")[["nodes", "edges"]].mean()
+summary.loc["all"] = df[["nodes", "edges"]].mean()
+print(summary.round(1))
+print(df[["nodes", "edges"]].describe().round(1))
+
+os.makedirs(f"{root}/stats", exist_ok=True)
+summary.to_csv(f"{root}/stats/avg_nodes_edges.csv")
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+summary.plot.bar(ax=axes[0], rot=0)
+axes[0].set_title("Average nodes / edges per query")
+axes[0].set_ylabel("count")
+axes[1].hist([df["nodes"], df["edges"]], bins=50, label=["nodes", "edges"])
+axes[1].set_title("Distribution per query")
+axes[1].set_xlabel("count")
+axes[1].legend()
+plt.tight_layout()
+plt.savefig(f"{root}/stats/avg_nodes_edges.png", dpi=150)
+plt.show()
+```
+
+Rows in `nodes/{i}.csv` / `edges/{i}.csv` are the unique entities and
+triples of the full per-question graph (before retrieval). The `val` split
+name must match the file `val_indices.txt` written by `generate_split`.
+
 ### Stage B: check one graph and SentenceBERT before the full embedding job
 
 ```python
@@ -249,6 +330,35 @@ These assertions matter because
 returns an empty tensor instead of raising.
 
 ### Stage C: embed all questions, nodes and edges
+
+**Recommended on Kaggle (2 GPUs, resumable).** The original `step_two` is a
+single process on one GPU and re-embeds every repeated relation string, which
+measured ~52 s per graph (~67 h) on a T4. The sharded variant
+[webqsp_sharded.py](../../src/dataset/preprocess/webqsp_sharded.py) runs one
+process per GPU, embeds each unique string once per graph, and skips finished
+graphs so it can be restarted. Stop the running `step_two` cell first.
+
+```python
+import os, subprocess
+
+procs = []
+for shard in range(2):
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(shard)}
+    log = open(f"/kaggle/working/embed_shard{shard}.log", "w")
+    procs.append(subprocess.Popen(
+        [PY, "-u", "-m", "src.dataset.preprocess.webqsp_sharded",
+         "--shard", str(shard), "--num_shards", "2",
+         "--batch_size", "64", "--fp16"],
+        cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+    ))
+```
+
+Monitor with `!tail -c 300 /kaggle/working/embed_shard0.log`, and wait with
+`[p.wait() for p in procs]` (all return codes must be 0). `--fp16` changes
+embeddings by small floating-point amounts; drop it for strict numerical
+fidelity (slower). Outputs are the same files as `step_two`.
+
+Original single-GPU version:
 
 ```python
 run("""
@@ -387,7 +497,7 @@ cached graphs, and cached descriptions together, plus:
 ```python
 with open("/kaggle/working/grag-environment.txt", "w") as f:
     subprocess.run(
-        [sys.executable, "-m", "uv", "pip", "freeze", "--python", PY],
+        [UV, "pip", "freeze", "--python", PY],
         stdout=f, check=True,
     )
 ```
