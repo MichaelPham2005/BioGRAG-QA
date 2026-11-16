@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Downloaded datasets and generated preprocessing artifacts.
+dataset/webqsp/raw/
+dataset/webqsp/nodes/
+dataset/webqsp/edges/
+dataset/webqsp/graphs/
+dataset/webqsp/split/
+dataset/webqsp/q_embs.pt
+dataset/webqsp/sims_*/
+dataset/webqsp/cached_graphs/
+dataset/webqsp/cached_desc/
+output/
+wandb/
