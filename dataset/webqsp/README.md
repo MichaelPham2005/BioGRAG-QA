@@ -216,15 +216,18 @@ size/MD5 is verified. Parts also receive SHA256 checksums in `manifest.json`,
 uploaded **last**. Re-running after a failure reuses matching finished parts
 (an interrupted in-flight part may restart). Source data are never deleted.
 
-Download every `part-*.tar.gz` plus `manifest.json` from the printed Drive folder.
-Verify each archive's SHA256 against `manifest["archives"]` before extraction.
-Extract the verified archives at the repository root; their paths start with
-`output/<prepared-folder>/...` and `output/<run-folder>/...`.
-Use the same original Kaggle working paths listed in `manifest["restore_paths"]`
-and the matching helper version because resume checks deliberately reject changed
-paths/code/settings. Then `pipeline.CompactDataset(RUN)` provides the inputs for
-the downstream GraphLLM classifier (ExplaGraphs) or QA task (WebQSP).
-The existing training registry still needs that explicit adapter.
+For downstream training, use the Colab notebooks below: they mount Drive, verify
+archive/file hashes, and restore into new Colab paths automatically. They preserve
+the producer configuration bytes and accept older format-1 ExplaGraphs snapshots.
+The producer code hash is provenance, not a requirement to use identical consumer
+code for read-only training.
+
+For **resuming preprocessing**, use the matching producer helper and original
+Kaggle working paths listed in `manifest["restore_paths"]`; strict resume checks
+deliberately reject changed paths/code/settings. A manual restore needs every
+`part-*.tar.gz` and `manifest.json`, verified archive SHA256s, safe extraction,
+and file-level verification. Archive paths start with `output/<folder>/...`.
+The original training registry still does not automatically consume compact data.
 
 The upload happens only when the final cell executes; it cannot protect an
 unfinished run if Kaggle kills the session earlier. Keep Kaggle Save Version /
@@ -237,6 +240,65 @@ without it. The offline upload/archive regression tests use a fake Drive service
 python -m unittest discover -s tests -p 'test_*preprocess.py'
 python -m unittest discover -s tests -p test_drive_backup.py
 ```
+
+## Downstream training on Colab (single T4)
+
+- [ExplaGraphs classification](../../notebook/colab/grag-expla-graphs-downstream.ipynb)
+- [WebQSP question answering](../../notebook/colab/grag-webqsp-downstream.ipynb)
+- [Shared downstream helpers](../../src/utils/notebook_downstream/)
+
+These notebooks consume the completed preprocessing backup without rerunning
+SentenceBERT or retrieval. They use Colab's native environment and mount Drive.
+Accept the gated Llama-2 license and add `HF_TOKEN` to Colab Secrets first.
+Push/upload the new helpers before cloning the repository remotely.
+
+The selected backbone is **`meta-llama/Llama-2-7b-chat-hf`**, deliberately different
+from the repository's base-model default. NF4 4-bit QLoRA freezes the backbone and
+trains rank-8 adapters (`q_proj`, `v_proj`, alpha 16, dropout .05), alongside the
+original 4-layer, 4-head, 1024-wide GAT and graph-to-token projector. The paper's
+[chat-model passage](https://arxiv.org/html/2405.16506v3#S5.SS2) concerns the
+no-retrieval baseline, not a guarantee of identical settings for every experiment.
+The source GAT is reused without redesign: its `GATConv` lacks `edge_dim`, so
+modern PyG does not directly include relation embeddings in attention.
+
+Run the default smoke subset first, then set **`SMOKE_TEST=False`** for all retained
+splits. The full default is 3 epochs, microbatch 1, accumulation 4, context budget
+512, description cap 256. Targets are capped at 8 tokens for classification /
+32 for QA, with truncation counts reported. Questions that cannot fit raise an
+error. These settings are conservative starting points, **not a guaranteed T4 fit**
+for arbitrarily large retrieved WebQSP graphs or an exact paper reproduction.
+
+Outputs are automatically backed up to
+`MyDrive/GRAG downstream/<dataset>/<run-name>/`:
+
+- `run.json`: settings, pinned model SHA, data/code fingerprints and selected IDs;
+- `last.pt`: resumable adapters, graph modules, optimizer/scaler, RNG/progress;
+- `best.pt`: adapters and graph modules selected by validation loss;
+- training history, token-limit report, prediction configuration, raw predictions,
+  and metrics.
+
+Checkpoints never include the frozen Llama weights or HF token. Optimizer-step
+checkpoints are backed up every 50 updates and at epoch boundaries; predictions
+every 10 examples and at completion. A failed Drive copy stops explicitly while
+retaining local files. Resume with the same run name/settings; changed runs require
+a fresh name. The best validation checkpoint is reloaded before testing.
+
+ExplaGraphs reports accuracy, macro-F1 and invalid outputs using standalone
+`support`/`counter` words. WebQSP retains the source substring-based metrics and
+reports original/retained test counts, exclusions and the actual evaluated count.
+Smoke metrics are labelled as subset results. Graph-only WebQSP and retrieved
+ExplaGraphs remain modified experiments, not directly comparable paper scores.
+
+Offline checks use tiny random Llama weights and real PyTorch/PyG/PEFT:
+
+```bash
+python -m unittest discover -s tests -p test_notebook_downstream.py
+```
+
+They verify restore integrity, old/new artifact consumption, label masking,
+gradient flow, accumulation/remainder, interrupted resume, generation, metrics,
+backup, and notebook schema/syntax. Live gated-model loading, bitsandbytes on a
+T4, Colab/Drive mounting and full-dataset memory use require remote validation.
 
 ## Legacy full-cache workflow (reference only)
 
