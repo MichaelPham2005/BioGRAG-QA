@@ -74,16 +74,19 @@ flowchart LR
 ### Main objective equations (paper, written directly)
 
 **(Eq. 1) Autoregressive generation conditioned on retrieved subgraph**
+
 $$
 p_\theta(Y\mid[q,\hat g])=\prod_{i=1}^{n} p_\theta(y_i\mid y_{<i},[q,\hat g])
 $$
 
 **(Eq. 2) Retrieve optimal subgraph (NP-hard form)**
+
 $$
 \max_{\hat g} f(\hat g) = \max_{V_{\text{key}}} f\left(\bigcup_{v\in V_{\text{key}}} G[N_K^*(v)]\right)
 $$
 
 **(Eq. 3) Divide-and-conquer approximation used by GRAG**
+
 $$
 \max_{V_{\text{key}}} f\left(\bigcup_{v\in V_{\text{key}}} G[N_K^*(v)]\right)
 \approx
@@ -205,30 +208,39 @@ Primary implementation: [src/utils/graph_retrieval.py](src/utils/graph_retrieval
 ### Core equations used in this stage (explicit)
 
 **(Eq. 4) Textual subgraph embedding**
+
 $$
 z_g = \text{POOL}\left(\text{PLM}(\{T_n\}_{n\in V_g}, \{T_e\}_{e\in E_g})\right)\in \mathbb{R}^d
 $$
+
 Code equivalent: mean pooling of node/edge embeddings in `get_triplets` ([src/utils/graph_retrieval.py:23](src/utils/graph_retrieval.py#L23)).
 
 **(Eq. 5) Query embedding**
+
 $$
 z_q = \text{PLM}(q)\in \mathbb{R}^d
 $$
+
 Code equivalent: precomputed `q_embs.pt` ([src/dataset/preprocess/webqsp.py:95](src/dataset/preprocess/webqsp.py#L95), [src/dataset/preprocess/expla_graphs.py:60](src/dataset/preprocess/expla_graphs.py#L60)).
 
 **(Eq. 6) Top-N ranking**
+
 $$
 S_N(G)=\text{Top-}N_{g\in S(G)}\ \cos(z_q,z_g)
 $$
+
 Code equivalent: cosine + `torch.topk` ([src/utils/graph_retrieval.py:318](src/utils/graph_retrieval.py#L318)-[src/utils/graph_retrieval.py:322](src/utils/graph_retrieval.py#L322)).
 
 **(Eq. 7)(Eq. 8) Node/edge relevance scalars**
+
 $$
 z_n=\text{PLM}(T_n),\ \alpha_n=\text{MLP}_{\phi_1}(z_n \ominus z_q)
 $$
+
 $$
 z_e=\text{PLM}(T_e),\ \alpha_e=\text{MLP}_{\phi_2}(z_e \ominus z_q)
 $$
+
 In code, $\ominus$ is configured by `--distance_operator` (`euclidean`, `manhattan`, `element`) and then passed through MLP + sigmoid in [src/model/gnn.py:66](src/model/gnn.py#L66)-[src/model/gnn.py:75](src/model/gnn.py#L75), [src/model/gnn.py:84](src/model/gnn.py#L84)-[src/model/gnn.py:94](src/model/gnn.py#L94).
 
 1. **K-hop ego-graph extraction**  
@@ -251,22 +263,28 @@ In code, $\ominus$ is configured by `--distance_operator` (`euclidean`, `manhatt
 ### Core equations used in this stage (explicit)
 
 **(Eq. 9) Relevance-controlled message passing**
+
 $$
 m_u^{(l)}=\text{MSG}^{(l)}\left(\alpha_u\cdot h_u^{(l-1)},\alpha_{uv}\cdot e_{uv}\right)
 $$
+
 Code behavior: scale node/edge features before graph convolution (`x *= x_weights`, `edge_attr *= edge_weights`) in [src/model/gnn.py:75](src/model/gnn.py#L75), [src/model/gnn.py:94](src/model/gnn.py#L94).
 
 **(Eq. 10) Graph-to-LLM alignment**
+
 $$
 h_{\hat g}=\text{MLP}_{\phi_3}(\text{GNN}_{\Phi}(\hat g))\in \mathbb{R}^{d_{\text{LLM}}}
 $$
+
 Code behavior: `graph_encoder` + `projector` in [src/model/graph_llm.py:110](src/model/graph_llm.py#L110)-[src/model/graph_llm.py:121](src/model/graph_llm.py#L121), [src/model/graph_llm.py:88](src/model/graph_llm.py#L88)-[src/model/graph_llm.py:92](src/model/graph_llm.py#L92).
 
 **(Eq. 11) Final generation with soft+hard prompts**
+
 $$
 p_{\theta,\phi_1,\phi_2,\phi_3,\Phi}(Y\mid q,G)
 =\prod_{i=1}^{n} p_{\theta,\phi_1,\phi_2,\phi_3,\Phi}\left(y_i\mid y_{<i},[h_{\hat g};h_T]\right)
 $$
+
 Code behavior: prepend graph token embedding before text embeddings in [src/model/graph_llm.py:150](src/model/graph_llm.py#L150), [src/model/graph_llm.py:202](src/model/graph_llm.py#L202).
 
 ## Text view (hard prompt)
@@ -340,10 +358,12 @@ During training, the text branch additionally includes the ground-truth answer a
 - Labels before answer span are masked by `IGNORE_INDEX=-100`: [src/model/graph_llm.py:18](src/model/graph_llm.py#L18), [src/model/graph_llm.py:154](src/model/graph_llm.py#L154).
 
 Practical training loss form in this implementation:
+
 $$
 \mathcal{L}_{\text{train}}
 =-\sum_{t\in \text{answer tokens}}\log p_\theta(y_t\mid y_{<t}, h_{\hat g}, h_T)
 $$
+
 because non-answer tokens are masked with `IGNORE_INDEX`.
 
 ## Paper equation ↔ code mapping
