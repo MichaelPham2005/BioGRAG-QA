@@ -283,6 +283,13 @@ every 10 examples and at completion. A failed Drive copy stops explicitly while
 retaining local files. Resume with the same run name/settings; changed runs require
 a fresh name. The best validation checkpoint is reloaded before testing.
 
+Section 7 displays `tqdm` progress for training updates and validation batches,
+including elapsed time, ETA and loss. Training also displays the learning rate.
+Each completed epoch prints training/validation durations and total wall time
+including Drive backups; training/validation seconds are stored in the history.
+Resumed bars start at the saved update count, but their timings cover only the
+current session's remaining work.
+
 FP16 AMP starts with loss scale 1024. Non-finite gradients trigger a scaler
 backoff and retry of the same accumulation group, without updating weights or
 advancing progress. BatchNorm buffers and random state are restored on retries.

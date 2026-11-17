@@ -9,12 +9,14 @@ import os
 from pathlib import Path
 import random
 import re
+import time
 import warnings
 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Subset
 from torch_geometric.nn import global_mean_pool
+from tqdm.auto import tqdm
 
 from src.utils.notebook_downstream.artifacts import (
     atomic_json, backup_file, checksum, collate, load_source,
@@ -334,16 +336,19 @@ def load_best(model, output, signature):
     model.load_learned_state(checkpoint["learned"])
 
 
-def validation_loss(model, dataset, indices, batch_size):
+def validation_loss(model, dataset, indices, batch_size, description="Validation"):
     model.eval()
     loader = DataLoader(Subset(dataset, indices), batch_size=batch_size, collate_fn=collate, num_workers=0)
     total = 0.
-    with torch.inference_mode():
-        for batch in loader:
+    with torch.inference_mode(), tqdm(
+        loader, desc=description, unit="batch", leave=False, dynamic_ncols=True,
+    ) as progress:
+        for batch in progress:
             loss = model(batch)
             if not torch.isfinite(loss):
                 raise FloatingPointError("Validation loss is not finite.")
             total += loss.item()
+            progress.set_postfix(loss=f"{loss.item():.4f}", refresh=False)
     return total / len(loader)
 
 
@@ -445,6 +450,7 @@ def fit(model, dataset, splits, signature, output, drive_output):
         epoch = state["epoch"]
         if state["best_epoch"] >= 0 and epoch - 1 - state["best_epoch"] >= config.patience:
             break
+        epoch_started = time.monotonic()
         ordered = list(splits["train"])
         random.Random(config.seed + epoch).shuffle(ordered)
         total_batches = math.ceil(len(ordered) / config.batch_size)
@@ -452,37 +458,58 @@ def fit(model, dataset, splits, signature, output, drive_output):
         if cursor != total_batches and cursor % config.grad_accum:
             raise ValueError("Resume cursor is not at an optimizer-step boundary.")
         model.train()
-        for group_start in range(cursor, total_batches, config.grad_accum):
-            group_end = min(group_start + config.grad_accum, total_batches)
-            indices = ordered[group_start * config.batch_size:group_end * config.batch_size]
-            loss_sum, batches, overflows = accumulate_group(
-                model, dataset, indices, parameters, optimizer, scaler, epoch, group_start,
-            )
-            state["train_loss_sum"] += loss_sum
-            state["train_batches"] += batches
-            state["amp_overflows"] += overflows
-            progress = epoch + group_end / total_batches
-            if progress < config.warmup_epochs:
-                factor = progress / config.warmup_epochs
-            else:
-                factor = 0.5 * (1 + math.cos(math.pi * (progress - config.warmup_epochs)
-                                            / max(1e-9, config.epochs - config.warmup_epochs)))
-            for group in optimizer.param_groups:
-                group["lr"] = config.learning_rate * factor
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            state["optimizer_steps"] += 1
-            state["next_batch"] = group_end
-            if state["optimizer_steps"] % config.checkpoint_steps == 0:
-                save_and_backup(checkpoint_data(model, optimizer, scaler, signature, state),
-                                "last.pt", output, drive_output, checkpoint=True)
-                print(f"Backed up optimizer step {state['optimizer_steps']}.", flush=True)
-        val_loss = validation_loss(model, dataset, splits["val"], config.batch_size)
+        description = f"Epoch {epoch + 1}/{config.epochs} train"
+        with tqdm(
+            range(cursor, total_batches, config.grad_accum),
+            total=math.ceil(total_batches / config.grad_accum),
+            initial=math.ceil(cursor / config.grad_accum),
+            desc=description, unit="update", dynamic_ncols=True,
+        ) as progress_bar:
+            for group_start in progress_bar:
+                group_end = min(group_start + config.grad_accum, total_batches)
+                indices = ordered[group_start * config.batch_size:group_end * config.batch_size]
+                loss_sum, batches, overflows = accumulate_group(
+                    model, dataset, indices, parameters, optimizer, scaler, epoch, group_start,
+                )
+                state["train_loss_sum"] += loss_sum
+                state["train_batches"] += batches
+                state["amp_overflows"] += overflows
+                progress = epoch + group_end / total_batches
+                if progress < config.warmup_epochs:
+                    factor = progress / config.warmup_epochs
+                else:
+                    factor = 0.5 * (1 + math.cos(math.pi * (progress - config.warmup_epochs)
+                                                / max(1e-9, config.epochs - config.warmup_epochs)))
+                for group in optimizer.param_groups:
+                    group["lr"] = config.learning_rate * factor
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                state["optimizer_steps"] += 1
+                state["next_batch"] = group_end
+                progress_bar.set_postfix(
+                    loss=f"{loss_sum / batches:.4f}",
+                    lr=f"{optimizer.param_groups[0]['lr']:.2e}", refresh=False,
+                )
+                if state["optimizer_steps"] % config.checkpoint_steps == 0:
+                    progress_bar.set_description(f"{description} (Drive backup)")
+                    save_and_backup(checkpoint_data(model, optimizer, scaler, signature, state),
+                                    "last.pt", output, drive_output, checkpoint=True)
+                    progress_bar.set_description(description, refresh=False)
+                    tqdm.write(f"Backed up optimizer step {state['optimizer_steps']}.")
+        train_seconds = time.monotonic() - epoch_started
+        validation_started = time.monotonic()
+        val_loss = validation_loss(
+            model, dataset, splits["val"], config.batch_size,
+            description=f"Epoch {epoch + 1}/{config.epochs} validation",
+        )
+        validation_seconds = time.monotonic() - validation_started
         entry = {"epoch": epoch, "train_loss": state["train_loss_sum"] / state["train_batches"],
                  "validation_loss": val_loss, "optimizer_steps": state["optimizer_steps"],
-                 "amp_overflows": state["amp_overflows"]}
+                 "amp_overflows": state["amp_overflows"],
+                 "train_seconds": train_seconds, "validation_seconds": validation_seconds}
         state["history"].append(entry)
+        tqdm.write(f"Epoch {epoch + 1}/{config.epochs}: saving checkpoints and backing up to Drive...")
         if val_loss < state["best_loss"]:
             state["best_loss"], state["best_epoch"] = val_loss, epoch
             save_and_backup({"signature": signature, "learned": model.learned_state(),
@@ -492,7 +519,13 @@ def fit(model, dataset, splits, signature, output, drive_output):
         save_and_backup(checkpoint_data(model, optimizer, scaler, signature, state),
                         "last.pt", output, drive_output, checkpoint=True)
         save_and_backup(state["history"], "history.json", output, drive_output)
-        print(entry, flush=True)
+        tqdm.write(
+            f"Epoch {epoch + 1}/{config.epochs} complete | "
+            f"train loss {entry['train_loss']:.4f} | validation loss {val_loss:.4f} | "
+            f"train {tqdm.format_interval(train_seconds)} | "
+            f"validation {tqdm.format_interval(validation_seconds)} | "
+            f"total {tqdm.format_interval(time.monotonic() - epoch_started)} (including backups)"
+        )
     load_best(model, output, signature)
     save_and_backup(state["history"], "history.json", output, drive_output)
     return state["history"]
