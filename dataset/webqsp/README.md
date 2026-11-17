@@ -51,7 +51,7 @@ reproduction of the authors' pipeline.
 ### Run order and limits
 
 1. Clone/reuse the checkout and validate both GPUs.
-2. Prepare text tables and original split IDs; inspect size distributions.
+2. Prepare text tables, source-ID mappings and retained split IDs; inspect size distributions.
 3. Configure the run (model/source revisions are recorded) and smoke-test two
    samples, one per GPU.
 4. Inspect compact versus expanded sizes and retrieval/model-input shapes.
@@ -75,6 +75,37 @@ Preprocessing optimizes **zero** parameters; no downstream Llama model is
 counted or timed. Two GPU copies still represent one logical encoder model.
 The separate [metrics helper](../../src/utils/notebook_preprocessing/preprocessing_metrics.py)
 does not change the main pipeline's source hash or invalidate existing caches.
+
+### WebQSP questions with empty source graphs
+
+The pinned WebQSP source includes questions with `graph=[]`, for example global
+source index 2937 (validation row 111, native ID `WebQTrn-1466`). This is source
+data, not an HF authentication/download error. An `HF_TOKEN` is optional for the
+public dataset and encoder; the unauthenticated warning concerns rate limits.
+
+The compact **graph-only experiment excludes empty source graphs with an audit**
+rather than fabricating graph evidence or passing zero-node graphs into graph
+pooling. Preparation prints each exclusion and writes `excluded.json`, including
+the reason, original source index/native ID, split/local index, question and label.
+Its hash is recorded in `prepared.json`, and Drive backups include the report.
+The source count equals the retained count plus the excluded count.
+
+Retained samples get contiguous processing `id` values for file names, sharding,
+and filtered split files. Every record and generated sample also carries
+`source_index`, `source_id`, `source_split`, and `source_split_index`.
+`prepared.json` stores both original `source_splits` and retained `splits`.
+Split membership/order is preserved for retained questions, but split sizes and
+**evaluation denominators are reduced**. Report these exclusions; do not present
+graph-only results as full-source/paper-comparable results. No question/answer
+text is used to invent replacement graph nodes. ExplaGraphs remains unchanged.
+
+If preparation previously stopped at an empty graph, upload the updated helper
+and use section 3 of the updated WebQSP notebook. Its new default directories are
+`output/webqsp-prepared-graph-only` and
+`output/webqsp-retrieval-fp32-graph-only`; they leave the old partial files intact.
+Rerun preparation, then the smoke check and full job. Use a new run directory if
+the helper/configuration changed; never edit hashes to force stale cache reuse.
+Do not delete existing outputs just to recover from this error.
 
 Workers use disjoint modulo shards and per-shard locks. The blocking monitor
 stops its owned processes on interruption or worker failure; it never kills
@@ -169,7 +200,8 @@ for the consent/redirect requirements.
 
 #### What is saved, and how to restore it for the LLM task
 
-- Prepared node/edge CSVs, records, source metadata, and original split IDs.
+- Prepared node/edge CSVs, records, source metadata, retained split IDs, original
+  source/split mappings, and any empty-graph exclusion audit.
 - All compact retrieved samples: their node/relation features, query embeddings,
   expansion maps, graph edges, hard descriptions, questions, and gold labels.
 - Run configuration and session provenance. The source commit/helper hash lets

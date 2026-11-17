@@ -201,11 +201,11 @@ class StreamingTests(unittest.TestCase):
             _fingerprint = "fixture"
 
         source = {
-            "train": Rows([{"question": "first", "answer": ["A"],
+            "train": Rows([{"id": "train-first", "question": "first", "answer": ["A"],
                             "graph": [("Head", "Relation", "Tail")]}]),
-            "validation": Rows([{"question": "second", "answer": ["B", "C"],
+            "validation": Rows([{"id": "val-second", "question": "second", "answer": ["B", "C"],
                                  "graph": [("X", "R", "Y")]}]),
-            "test": Rows([{"question": "third", "answer": ["D"],
+            "test": Rows([{"id": "test-third", "question": "third", "answer": ["D"],
                            "graph": [("K", "R", "L")]}]),
         }
         with tempfile.TemporaryDirectory() as temporary, \
@@ -219,6 +219,58 @@ class StreamingTests(unittest.TestCase):
             nodes, edges = pipeline.load_tables(temporary, records[0], "webqsp")
             self.assertEqual(nodes.node_attr.tolist(), ["head", "tail"])
             self.assertEqual(edges.edge_attr.tolist(), ["Relation"])
+
+    def test_empty_webqsp_graphs_are_audited_without_losing_source_or_split_mapping(self):
+        class Rows(list):
+            _fingerprint = "fixture"
+
+        def row(index, empty=False):
+            return {"id": f"native-{index}", "question": f"question {index}",
+                    "answer": ["Answer"], "graph": [] if empty else [("A", "R", "B")]}
+
+        source = {
+            "train": Rows([row(0, empty=True), row(1)]),
+            "validation": Rows([row(2, empty=True), row(3)]),
+            "test": Rows([row(4), row(5, empty=True)]),
+        }
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.dict("sys.modules", {"datasets": types.SimpleNamespace(
+                    load_dataset=lambda *args, **kwargs: source)}):
+            root = Path(temporary)
+            pipeline.prepare("webqsp", root, revision="fixture-revision")
+            metadata, records = pipeline.read_prepared(root)
+            excluded = json.loads((root / "excluded.json").read_text())
+            self.assertEqual((metadata["source_count"], metadata["count"], metadata["excluded_count"]),
+                             (6, 3, 3))
+            self.assertEqual(metadata["splits"], {"train": [0], "val": [1], "test": [2]})
+            self.assertEqual(metadata["source_splits"], {"train": [0, 1], "val": [2, 3], "test": [4, 5]})
+            self.assertEqual([record["id"] for record in records], [0, 1, 2])
+            self.assertEqual([record["source_index"] for record in records], [1, 3, 4])
+            self.assertEqual([record["source_id"] for record in records],
+                             ["native-1", "native-3", "native-4"])
+            self.assertEqual(records[1]["source_split"], "val")
+            self.assertEqual(records[1]["source_split_index"], 1)
+            self.assertEqual([record["source_index"] for record in excluded], [0, 2, 5])
+            self.assertTrue(all(record["reason"] == "empty_graph" for record in excluded))
+            self.assertEqual(sorted(path.name for path in (root / "nodes").glob("*.csv")),
+                             ["0.csv", "1.csv", "2.csv"])
+            (root / "excluded.json").write_text("[]")
+            with self.assertRaisesRegex(ValueError, "Exclusion report changed"):
+                pipeline.read_prepared(root)
+
+    def test_all_empty_webqsp_graphs_fail_with_audit_instead_of_an_empty_dataset(self):
+        class Rows(list):
+            _fingerprint = "fixture"
+
+        source = {split: Rows([{"id": split, "question": "question", "answer": ["a"], "graph": []}])
+                  for split in ("train", "validation", "test")}
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.dict("sys.modules", {"datasets": types.SimpleNamespace(
+                    load_dataset=lambda *args, **kwargs: source)}):
+            with self.assertRaisesRegex(ValueError, "No nonempty graphs"):
+                pipeline.prepare("webqsp", temporary, revision="fixture-revision")
+            self.assertEqual(len(json.loads((Path(temporary) / "excluded.json").read_text())), 3)
+            self.assertFalse((Path(temporary) / "prepared.json").exists())
 
     def test_exclusive_shard_lock_rejects_duplicate_workers(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -267,6 +319,8 @@ class StreamingTests(unittest.TestCase):
                 self.assertEqual((output / "samples/0.pt").read_bytes(), original)
             pipeline.validate_run(output)
             dataset = pipeline.CompactDataset(output)
+            self.assertEqual(dataset[0]["source_index"], 0)
+            self.assertEqual(dataset[0]["source_id"], None)
             self.assertEqual({k: len(v) for k, v in dataset.get_idx_split().items()},
                              {"train": 6, "val": 2, "test": 2})
             batch = Batch.from_data_list([dataset[0]["graph"], dataset[1]["graph"]])

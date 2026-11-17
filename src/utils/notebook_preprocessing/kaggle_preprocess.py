@@ -75,13 +75,13 @@ def prepare(dataset, output, raw=None, revision="main"):
         from datasets import load_dataset
 
         source = load_dataset("rmanluo/RoG-webqsp", revision=revision)
-        splits, offset = {}, 0
+        source_splits, offset = {}, 0
         for name, split in (("train", "train"), ("val", "validation"), ("test", "test")):
-            splits[name] = list(range(offset, offset + len(source[split])))
+            source_splits[name] = list(range(offset, offset + len(source[split])))
             offset += len(source[split])
         rows = (
             (row["question"], f'Question: {row["question"]}\nAnswer: ',
-             "|".join(row["answer"]).lower(), row["graph"])
+             "|".join(row["answer"]).lower(), row["graph"], row["id"])
             for split in ("train", "validation", "test") for row in source[split]
         )
         provenance = {
@@ -100,28 +100,52 @@ def prepare(dataset, output, raw=None, revision="main"):
             if not triples or any(len(triple) != 3 for triple in triples):
                 raise ValueError(f"Malformed ExplaGraphs graph at row {len(rows)}")
             question = f"Argument 1: {row.arg1}\nArgument 2: {row.arg2}\n{PROMPT}"
-            rows.append((question, question, row.label, triples))
+            rows.append((question, question, row.label, triples, None))
         train, rest = train_test_split(list(range(len(rows))), test_size=0.4, random_state=42)
         val, test = train_test_split(rest, test_size=0.5, random_state=42)
-        splits = {"train": train, "val": val, "test": test}
+        source_splits = {"train": train, "val": val, "test": test}
         provenance = {"file": Path(raw).name, "sha256": digest(raw)}
     for directory in ("nodes", "edges", "split"):
         (output / directory).mkdir(exist_ok=True)
-    records = []
-    for index, (query, question, label, triples) in enumerate(rows):
+    source_locations = {
+        index: (name, split_index)
+        for name, indices in source_splits.items()
+        for split_index, index in enumerate(indices)
+    }
+    records, exclusions = [], []
+    for source_index, (query, question, label, triples, source_id) in enumerate(rows):
         if not query.strip() or not label.strip():
-            raise ValueError(f"Empty question or label at row {index}")
+            raise ValueError(f"Empty question or label at source row {source_index}")
+        source_split, source_split_index = source_locations[source_index]
+        source_info = {
+            "source_index": source_index, "source_id": source_id,
+            "source_split": source_split, "source_split_index": source_split_index,
+        }
         nodes, edges = text_tables(triples, dataset)
         if nodes.empty:
-            raise ValueError(f"Sample {index} has no nodes; inspect the source graph.")
+            if dataset != "webqsp":
+                raise ValueError(f"Sample {source_index} has no nodes; inspect the source graph.")
+            exclusions.append(dict(source_info, reason="empty_graph", question=question, label=label))
+            print(f"Excluding empty graph: source_index={source_index} source_id={source_id} "
+                  f"split={source_split} split_index={source_split_index}", flush=True)
+            continue
+        index = len(records)
         nodes.to_csv(output / "nodes" / f"{index}.csv", index=False)
         edges.to_csv(output / "edges" / f"{index}.csv", index=False)
         records.append({
-            "id": index, "query": query, "question": question, "label": label,
+            "id": index, **source_info, "query": query, "question": question, "label": label,
             "nodes": len(nodes), "edges": len(edges),
             "nodes_sha256": digest(output / "nodes" / f"{index}.csv"),
             "edges_sha256": digest(output / "edges" / f"{index}.csv"),
         })
+    atomic_json(exclusions, output / "excluded.json")
+    if not records:
+        raise ValueError(f"No nonempty graphs remain. See {output / 'excluded.json'}.")
+    source_to_id = {record["source_index"]: record["id"] for record in records}
+    splits = {
+        name: [source_to_id[index] for index in indices if index in source_to_id]
+        for name, indices in source_splits.items()
+    }
     atomic_json(records, output / "records.json")
     for name, indices in splits.items():
         (output / "split" / f"{name}_indices.txt").write_text(
@@ -129,9 +153,13 @@ def prepare(dataset, output, raw=None, revision="main"):
         )
     atomic_json({
         "dataset": dataset, "count": len(records), "source": provenance,
+        "source_count": len(source_locations), "source_splits": source_splits,
+        "empty_graph_policy": "exclude_with_audit" if dataset == "webqsp" else "reject",
+        "excluded_count": len(exclusions), "exclusions_sha256": digest(output / "excluded.json"),
         "records_sha256": digest(output / "records.json"), "splits": splits,
     }, output / "prepared.json")
-    print(f"Prepared {len(records)} {dataset} samples at {output}", flush=True)
+    print(f"Prepared {len(records)} of {len(source_locations)} {dataset} samples at {output}; "
+          f"excluded {len(exclusions)} empty graphs (see excluded.json).", flush=True)
 
 
 def read_prepared(directory):
@@ -140,6 +168,22 @@ def read_prepared(directory):
     if digest(directory / "records.json") != metadata["records_sha256"]:
         raise ValueError("Prepared records changed; use a new prepared directory.")
     records = json.loads((directory / "records.json").read_text())
+    if "exclusions_sha256" in metadata:
+        if digest(directory / "excluded.json") != metadata["exclusions_sha256"]:
+            raise ValueError("Exclusion report changed; use a new prepared directory.")
+        exclusions = json.loads((directory / "excluded.json").read_text())
+        source_ids = [record["source_index"] for record in records]
+        if (len(exclusions) != metadata["excluded_count"]
+                or sorted(source_ids + [row["source_index"] for row in exclusions])
+                != list(range(metadata["source_count"]))):
+            raise ValueError("Retained and excluded rows do not partition the source data.")
+        source_to_id = {record["source_index"]: record["id"] for record in records}
+        expected_splits = {
+            name: [source_to_id[index] for index in indices if index in source_to_id]
+            for name, indices in metadata["source_splits"].items()
+        }
+        if metadata["splits"] != expected_splits:
+            raise ValueError("Filtered split IDs do not match the original source splits.")
     indices = [i for split in metadata["splits"].values() for i in split]
     if (len(records) != metadata["count"]
             or [row["id"] for row in records] != list(range(len(records)))
@@ -363,7 +407,11 @@ def materialize(payload):
         question_edge=query.unsqueeze(0).repeat(len(edge_attr), 1),
         num_nodes=len(x),
     )
-    return {key: payload[key] for key in ("id", "question", "label", "desc")} | {"graph": graph}
+    sample = {key: payload[key] for key in ("id", "question", "label", "desc")}
+    sample.update({key: payload[key] for key in
+                   ("source_index", "source_id", "source_split", "source_split_index")
+                   if key in payload})
+    return sample | {"graph": graph}
 
 
 class CompactDataset(torch.utils.data.Dataset):
@@ -383,6 +431,9 @@ class CompactDataset(torch.utils.data.Dataset):
         payload = load_payload(self.output / "samples" / f"{index}.pt")
         if payload["id"] != index or payload["config_sha256"] != digest(self.output / "config.json"):
             raise ValueError(f"Wrong sample ID or run configuration: {index}")
+        for key in ("source_index", "source_id", "source_split", "source_split_index"):
+            if key in self.records[index] and payload.get(key) != self.records[index][key]:
+                raise ValueError(f"Wrong source mapping for sample {index}: {key}")
         return materialize(payload)
 
     def get_idx_split(self):
@@ -422,6 +473,8 @@ def worker(output, shard, stop=None):
             payload = retrieve_compact(nodes, edges, x, relations, relation_ids, query, config)
             payload.update(id=index, question=record["question"], label=record["label"],
                            config_sha256=config_hash, model_revision=encoder.revision)
+            payload.update({key: record[key] for key in
+                            ("source_index", "source_id", "source_split", "source_split_index")})
             del x, relations
             validate_payload(payload)
             buffer = io.BytesIO()

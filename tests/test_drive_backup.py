@@ -94,6 +94,7 @@ class DriveBackupTests(unittest.TestCase):
                             "edges_sha256": backup.checksum(edge)})
             (self.run / "samples" / f"{index}.pt").write_bytes(b"sample-data" * 100)
         (self.prepared / "records.json").write_text(json.dumps(records))
+        (self.prepared / "excluded.json").write_text('[{"source_index": 2, "reason": "empty_graph"}]')
         splits = {"train": [0], "val": [], "test": [1]}
         for split, indices in splits.items():
             (self.prepared / "split" / f"{split}_indices.txt").write_text(
@@ -101,6 +102,8 @@ class DriveBackupTests(unittest.TestCase):
             )
         (self.prepared / "prepared.json").write_text(json.dumps({
             "count": 2, "splits": splits,
+            "source_count": 3, "excluded_count": 1,
+            "exclusions_sha256": backup.checksum(self.prepared / "excluded.json"),
             "records_sha256": backup.checksum(self.prepared / "records.json"),
         }))
         (self.run / "config.json").write_text(json.dumps({
@@ -145,6 +148,8 @@ class DriveBackupTests(unittest.TestCase):
         self.assertFalse(any("credentials" in path or ".log" in path or "packages" in path
                              for path in restored))
         self.assertIn(f"output/{self.run.name}/benchmark/shard-0.json", restored)
+        self.assertIn(f"output/{self.prepared.name}/excluded.json", restored)
+        self.assertEqual((manifest["source_count"], manifest["excluded_count"]), (3, 1))
         count = len(self.drive.uploads)
         self.assertEqual(self.upload(), url)
         self.assertEqual(len(self.drive.uploads), count)

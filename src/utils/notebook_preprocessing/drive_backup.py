@@ -36,6 +36,9 @@ def collect_files(prepared, run):
     if {path.name for path in (run / "samples").glob("*.pt")} != expected:
         raise ValueError("Backup requires a complete run, not a smoke subset.")
     records = json.loads((prepared / "records.json").read_text())
+    if "exclusions_sha256" in metadata:
+        if checksum(prepared / "excluded.json") != metadata["exclusions_sha256"]:
+            raise ValueError("Exclusion report changed.")
     if len(records) != metadata["count"]:
         raise ValueError("Prepared record count is inconsistent.")
     for index, record in enumerate(records):
@@ -46,7 +49,7 @@ def collect_files(prepared, run):
                 raise ValueError(f"Prepared {folder} table changed for sample {index}.")
     files = []
     for root, patterns in (
-        (prepared, ["prepared.json", "records.json", "nodes/*.csv", "edges/*.csv",
+        (prepared, ["prepared.json", "records.json", "excluded.json", "nodes/*.csv", "edges/*.csv",
                     "split/*_indices.txt"]),
         (run, ["config.json", "samples/*.pt", "session-*-provenance.json", "benchmark/*.json"]),
     ):
@@ -74,6 +77,9 @@ def collect_files(prepared, run):
         "restore_paths": {"prepared": str(prepared), "run": str(run)},
         "files": [{key: value for key, value in item.items() if key != "_local"} for item in files],
     }
+    if "source_count" in metadata:
+        manifest.update(source_count=metadata["source_count"],
+                        excluded_count=metadata["excluded_count"])
     return manifest, files
 
 
