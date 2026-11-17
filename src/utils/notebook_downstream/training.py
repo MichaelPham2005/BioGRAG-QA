@@ -347,15 +347,75 @@ def validation_loss(model, dataset, indices, batch_size):
     return total / len(loader)
 
 
+def accumulate_group(model, dataset, indices, parameters, optimizer, scaler, epoch, batch_index):
+    loader = DataLoader(
+        Subset(dataset, indices), batch_size=model.settings.batch_size,
+        collate_fn=collate, num_workers=0,
+    )
+    cpu_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if model.device.type == "cuda" else []
+    python_rng = random.getstate()
+    buffers = [(buffer, buffer.clone()) for module in model.modules()
+               if isinstance(module, nn.BatchNorm1d) for buffer in module.buffers(recurse=False)]
+    overflows = 0
+    while True:
+        optimizer.zero_grad(set_to_none=True)
+        loss_sum = 0.
+        for batch in loader:
+            loss = model(batch)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"Non-finite training loss at epoch {epoch}, IDs {batch['id']}.")
+            scaler.scale(loss / len(loader)).backward()
+            loss_sum += loss.item()
+        scaler.unscale_(optimizer)
+        try:
+            torch.nn.utils.clip_grad_norm_(parameters, 0.1, error_if_nonfinite=True)
+        except RuntimeError as error:
+            invalid = [name for name, parameter in model.named_parameters()
+                       if parameter.requires_grad and parameter.grad is not None
+                       and not torch.isfinite(parameter.grad).all()]
+            if not invalid:
+                raise
+            context = f"epoch {epoch}, microbatch {batch_index}, parameters {invalid[:5]}"
+            if not scaler.is_enabled():
+                raise FloatingPointError(f"Non-finite gradients without AMP: {context}.") from error
+            old_scale = scaler.get_scale()
+            # GradScaler skips the invalid update; unscale_ already detected these gradients.
+            scaler.step(optimizer)
+            scaler.update()
+            new_scale = scaler.get_scale()
+            optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                for buffer, saved in buffers:
+                    buffer.copy_(saved)
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng:
+                torch.cuda.set_rng_state_all(cuda_rng)
+            random.setstate(python_rng)
+            overflows += 1
+            if (overflows >= 16 or not math.isfinite(new_scale)
+                    or not 0 < new_scale < old_scale):
+                raise FloatingPointError(
+                    f"Non-finite gradients persist after {overflows} AMP attempts: {context}; "
+                    f"loss scale {old_scale:g} -> {new_scale:g}. No invalid update was applied."
+                ) from error
+            warnings.warn(
+                f"AMP overflow at {context}; loss scale {old_scale:g} -> {new_scale:g}. "
+                f"Retrying the same accumulation group ({overflows}/16)."
+            )
+        else:
+            return loss_sum, len(loader), overflows
+
+
 def fit(model, dataset, splits, signature, output, drive_output):
     config = model.settings
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(parameters, lr=config.learning_rate,
                                  weight_decay=config.weight_decay, betas=(0.9, 0.95))
-    scaler = torch.amp.GradScaler("cuda", enabled=model.device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", init_scale=1024, enabled=model.device.type == "cuda")
     state = {"epoch": 0, "next_batch": 0, "optimizer_steps": 0,
              "train_loss_sum": 0., "train_batches": 0, "best_loss": float("inf"),
-             "best_epoch": -1, "history": []}
+             "best_epoch": -1, "amp_overflows": 0, "history": []}
     last = Path(output) / "last.pt"
     if last.exists():
         checkpoint = torch.load(last, map_location="cpu", weights_only=True)
@@ -391,44 +451,37 @@ def fit(model, dataset, splits, signature, output, drive_output):
         cursor = state["next_batch"]
         if cursor != total_batches and cursor % config.grad_accum:
             raise ValueError("Resume cursor is not at an optimizer-step boundary.")
-        loader = DataLoader(
-            Subset(dataset, ordered[cursor * config.batch_size:]),
-            batch_size=config.batch_size, collate_fn=collate, num_workers=0,
-        )
         model.train()
-        optimizer.zero_grad(set_to_none=True)
-        for batch_index, batch in enumerate(loader, start=cursor):
-            group_start = batch_index // config.grad_accum * config.grad_accum
-            group_size = min(config.grad_accum, total_batches - group_start)
-            loss = model(batch)
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"Non-finite training loss at epoch {epoch}, batch {batch_index}.")
-            scaler.scale(loss / group_size).backward()
-            state["train_loss_sum"] += loss.item()
-            state["train_batches"] += 1
-            if (batch_index + 1) % config.grad_accum == 0 or batch_index + 1 == total_batches:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(parameters, 0.1, error_if_nonfinite=True)
-                progress = epoch + (batch_index + 1) / total_batches
-                if progress < config.warmup_epochs:
-                    factor = progress / config.warmup_epochs
-                else:
-                    factor = 0.5 * (1 + math.cos(math.pi * (progress - config.warmup_epochs)
-                                                / max(1e-9, config.epochs - config.warmup_epochs)))
-                for group in optimizer.param_groups:
-                    group["lr"] = config.learning_rate * factor
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                state["optimizer_steps"] += 1
-                state["next_batch"] = batch_index + 1
-                if state["optimizer_steps"] % config.checkpoint_steps == 0:
-                    save_and_backup(checkpoint_data(model, optimizer, scaler, signature, state),
-                                    "last.pt", output, drive_output, checkpoint=True)
-                    print(f"Backed up optimizer step {state['optimizer_steps']}.", flush=True)
+        for group_start in range(cursor, total_batches, config.grad_accum):
+            group_end = min(group_start + config.grad_accum, total_batches)
+            indices = ordered[group_start * config.batch_size:group_end * config.batch_size]
+            loss_sum, batches, overflows = accumulate_group(
+                model, dataset, indices, parameters, optimizer, scaler, epoch, group_start,
+            )
+            state["train_loss_sum"] += loss_sum
+            state["train_batches"] += batches
+            state["amp_overflows"] += overflows
+            progress = epoch + group_end / total_batches
+            if progress < config.warmup_epochs:
+                factor = progress / config.warmup_epochs
+            else:
+                factor = 0.5 * (1 + math.cos(math.pi * (progress - config.warmup_epochs)
+                                            / max(1e-9, config.epochs - config.warmup_epochs)))
+            for group in optimizer.param_groups:
+                group["lr"] = config.learning_rate * factor
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            state["optimizer_steps"] += 1
+            state["next_batch"] = group_end
+            if state["optimizer_steps"] % config.checkpoint_steps == 0:
+                save_and_backup(checkpoint_data(model, optimizer, scaler, signature, state),
+                                "last.pt", output, drive_output, checkpoint=True)
+                print(f"Backed up optimizer step {state['optimizer_steps']}.", flush=True)
         val_loss = validation_loss(model, dataset, splits["val"], config.batch_size)
         entry = {"epoch": epoch, "train_loss": state["train_loss_sum"] / state["train_batches"],
-                 "validation_loss": val_loss, "optimizer_steps": state["optimizer_steps"]}
+                 "validation_loss": val_loss, "optimizer_steps": state["optimizer_steps"],
+                 "amp_overflows": state["amp_overflows"]}
         state["history"].append(entry)
         if val_loss < state["best_loss"]:
             state["best_loss"], state["best_epoch"] = val_loss, epoch

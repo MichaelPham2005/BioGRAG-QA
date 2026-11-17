@@ -283,6 +283,15 @@ every 10 examples and at completion. A failed Drive copy stops explicitly while
 retaining local files. Resume with the same run name/settings; changed runs require
 a fresh name. The best validation checkpoint is reloaded before testing.
 
+FP16 AMP starts with loss scale 1024. Non-finite gradients trigger a scaler
+backoff and retry of the same accumulation group, without updating weights or
+advancing progress. BatchNorm buffers and random state are restored on retries.
+After 16 failed attempts, training raises an error naming affected parameters.
+Clipping remains strict; it never scales invalid gradients into an optimizer
+update. Overflow counts are included in training history. After updating this
+helper, refresh the Colab checkout, restart Python, and use the notebooks' new
+`smoke-v2` / `full-v2` run names rather than overwriting old run fingerprints.
+
 ExplaGraphs reports accuracy, macro-F1 and invalid outputs using standalone
 `support`/`counter` words. WebQSP retains the source substring-based metrics and
 reports original/retained test counts, exclusions and the actual evaluated count.
