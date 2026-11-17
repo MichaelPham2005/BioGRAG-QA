@@ -1,5 +1,218 @@
 # WebQSP preparation on Kaggle (2 x T4)
 
+## Recommended: compact streaming notebooks
+
+For visualization and storage-conscious preprocessing, use the updated
+[WebQSP notebook](../../notebook/kaggle/grag-webqsp-data-processing.ipynb).
+The matching
+[ExplaGraphs notebook](../../notebook/kaggle/grag-expla-graphs-data-processing.ipynb)
+deliberately applies WebQSP-style retrieval to the supplied explanation graphs;
+this is **not the original ExplaGraphs baseline**.
+
+Both notebooks use Kaggle's current Python/PyTorch/CUDA and install only missing
+preprocessing dependencies. No virtual environment, Llama weights, Hugging Face
+token, `gensim`, `peft`, or `torch_scatter` is required for this new path.
+Enable Internet and select **GPU T4 x2** manually in Kaggle Settings.
+Commit/push or upload the updated notebooks and
+[shared helper](../../src/utils/notebook_preprocessing/kaggle_preprocess.py) before running them remotely.
+Notebook-specific preprocessing helpers live in
+[`src/utils/notebook_preprocessing/`](../../src/utils/notebook_preprocessing),
+separate from the model's other utilities; their regression tests remain under
+[`tests/`](../../tests).
+
+### Why these outputs are smaller
+
+Each worker embeds one query graph at a time, retrieves its ego-graphs immediately,
+then releases the full embeddings. It does **not** write `graphs/*.pt`,
+`cached_graphs/*.pt`, or repeated query-feature matrices. Compact samples store:
+
+- unique selected node/relation features as FP32 tensors;
+- integer mappings that reproduce overlapping ego components and their edges;
+- one query vector, ranking scores, source IDs, CSV description, question and label.
+
+`pipeline.CompactDataset(RUN)` in each notebook reconstructs the
+`id/question/label/desc/graph` sample contract, including repeated query fields,
+only when loading a sample. Storage sharing is lossless relative to the embeddings
+computed in that run. It is an explicit adapter: the legacy dataset registry and
+training entry point do **not** automatically read compact outputs. No training
+behavior or existing caches are changed by these notebooks.
+
+Retrieval keeps `k=2`, `topk=20`, `topk_entity=10`, `augment="none"`; top-k text
+selection does not prune the soft graph. Directed neighborhoods and concatenated
+overlapping egos follow the existing pipeline. WebQSP retains the author's
+removal of **all** edges with repeated endpoint pairs, but keeps filtered
+relation text aligned with its features. Single-center outputs, isolated nodes
+and edgeless graphs receive valid tensor shapes instead of silent fallbacks.
+ExplaGraphs query embeddings use the current row's arguments, correcting the
+legacy preprocessor's full-column interpolation in this new path only.
+These corrections and native dependency versions mean this is not bit-for-bit
+reproduction of the authors' pipeline.
+
+### Run order and limits
+
+1. Clone/reuse the checkout and validate both GPUs.
+2. Prepare text tables and original split IDs; inspect size distributions.
+3. Configure the run (model/source revisions are recorded) and smoke-test two
+   samples, one per GPU.
+4. Inspect compact versus expanded sizes and retrieval/model-input shapes.
+5. Set `RUN_FULL=True` only after reviewing disk/runtime estimates. Successful
+   samples are resumed; changed inputs/settings require a new directory.
+6. Validate the full run and save both prepared/run directories under `output/`.
+
+The **6a** cell in both notebooks counts parameters from the actual loaded
+SentenceBERT encoder and benchmarks preprocessing on both GPUs concurrently.
+It reports per-GPU weight-only memory, embedding/retrieval timings, and remaining
+runtime estimated from small/medium/large query-size buckets in each modulo
+shard. The estimate uses the slower shard's projected duration, not a presumed
+perfect 2x speedup, and excludes already-saved samples. It is a rough point
+estimate, not an upper bound: token lengths, neighborhood topology and hardware
+load can change throughput. Downloads, CSV preparation/plots, final full-run
+validation, disk writes, Drive upload, and benchmark/monitor overhead are excluded.
+The benchmark itself recomputes up to three representative queries per GPU and
+adds runtime, but never modifies sample caches. Small timing reports are kept in
+`RUN/benchmark/` and included in Drive backups.
+Preprocessing optimizes **zero** parameters; no downstream Llama model is
+counted or timed. Two GPU copies still represent one logical encoder model.
+The separate [metrics helper](../../src/utils/notebook_preprocessing/preprocessing_metrics.py)
+does not change the main pipeline's source hash or invalidate existing caches.
+
+Workers use disjoint modulo shards and per-shard locks. The blocking monitor
+stops its owned processes on interruption or worker failure; it never kills
+processes by name. Retrieval runs on CPU between GPU embedding batches, so
+continuous 100% utilization on both T4s is not expected.
+
+No graph-size cap or lossy precision/storage change is imposed. Compact storage
+reduces duplication but cannot guarantee that arbitrary graphs fit in RAM or
+Kaggle's disk/time quota. Estimates from two examples are not upper bounds.
+Workers refuse writes that would leave less than 2 GiB free. Old legacy caches
+are not deleted automatically. Save outputs and restore them to the same working
+paths to resume after a session reset; see the notebooks' final sections.
+
+Focused local regression checks (with torch, PyG, pandas, scikit-learn and
+transformers available):
+
+```bash
+python -m unittest discover -s tests -p test_kaggle_preprocess.py
+```
+
+### Google Drive backup (optional)
+
+Both notebooks now end with an optional automatic backup to **personal Google
+Drive**. Set `ENABLE_DRIVE_BACKUP=True` in the final cell before Run All, after
+configuring the secrets below. This cell first validates the **complete** run;
+two-sample smoke outputs are not accepted as a finished dataset.
+Kaggle cannot use Colab's `google.colab.drive.mount()`.
+
+The [Drive helper](../../src/utils/notebook_preprocessing/drive_backup.py)
+creates a private `GRAG preprocessing backups` folder using the limited
+[`drive.file` OAuth scope](https://developers.google.com/workspace/drive/api/guides/api-specific-auth).
+It does not request access to every file in your Drive, make files public, or
+delete/overwrite unrelated Drive files. It creates versioned snapshots rather
+than performing a destructive mirror.
+
+#### One-time OAuth setup (on your own computer, not inside Kaggle)
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), create/select a
+   project and enable **Google Drive API**.
+2. Configure Google Auth Platform's consent screen/audience for personal use.
+   If the app is in Testing, add your own Google account as a test user. Declare
+   `https://www.googleapis.com/auth/drive.file` under Data Access.
+3. Create an OAuth client with application type **Desktop app**. Download its
+   client JSON to a private location **outside this repository**. Keep the
+   notebook private while configuring credentials.
+4. With `google-auth-oauthlib` available in your local Python, run the following
+   **locally**, adjusting the private client-file path. It opens your local browser
+   for consent and receives the redirect on localhost. No password/token should
+   be entered into a notebook cell or sent in chat.
+
+```python
+import os
+from pathlib import Path
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+flow = InstalledAppFlow.from_client_secrets_file(
+    str(Path.home() / "private-google-oauth" / "client_secret.json"),
+    scopes=["https://www.googleapis.com/auth/drive.file"],
+)
+credentials = flow.run_local_server(
+    port=0, access_type="offline", prompt="consent",
+)
+if not credentials.refresh_token:
+    raise RuntimeError("No refresh token returned; repeat offline consent.")
+token_file = Path.home() / "private-google-oauth" / "drive-token.json"
+descriptor = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "w") as handle:
+    handle.write(credentials.to_json())
+print("Saved credentials privately. Do not upload this file to a notebook or Git.")
+```
+
+The destination directory must already exist and be private. The example refuses
+to overwrite an existing token file. Install `google-auth-oauthlib` only if that
+local import is missing. This local authorization step does not recreate the
+authors' environment or change Kaggle's Python.
+See Google's [desktop OAuth flow](https://developers.google.com/identity/protocols/oauth2/native-app)
+for the consent/redirect requirements.
+
+5. In Kaggle **Add-ons > Secrets**, add and enable for your notebook:
+
+   | Kaggle Secret | Value from your private OAuth files |
+   |---|---|
+   | `GDRIVE_CLIENT_ID` | `client_id` |
+   | `GDRIVE_CLIENT_SECRET` | `client_secret` |
+   | `GDRIVE_REFRESH_TOKEN` | `refresh_token` from the generated token file |
+
+   Never paste these values into source code, outputs, Git, or chat. The notebook
+   reads them through `UserSecretsClient` and refreshes the access token in memory.
+   OAuth apps in Testing commonly receive refresh tokens that expire after seven
+   days for Drive access; revoked/expired credentials need renewed consent.
+   Follow your account/organization's OAuth restrictions rather than bypassing them.
+
+#### What is saved, and how to restore it for the LLM task
+
+- Prepared node/edge CSVs, records, source metadata, and original split IDs.
+- All compact retrieved samples: their node/relation features, query embeddings,
+  expansion maps, graph edges, hard descriptions, questions, and gold labels.
+- Run configuration and session provenance. The source commit/helper hash lets
+  you restore the correct code; model weights and source code are not uploaded.
+
+Logs, package listings, credentials, HF caches, and legacy full-graph caches are
+excluded. The helper builds/uploads one compressed archive part at a time,
+targeting 256 MiB of source data per part; an individual larger file can exceed
+that target. It requires space for that part plus 1 GiB reserve, not a second
+complete dataset copy. Each upload is resumable within the request and its remote
+size/MD5 is verified. Parts also receive SHA256 checksums in `manifest.json`,
+uploaded **last**. Re-running after a failure reuses matching finished parts
+(an interrupted in-flight part may restart). Source data are never deleted.
+
+Download every `part-*.tar.gz` plus `manifest.json` from the printed Drive folder.
+Verify each archive's SHA256 against `manifest["archives"]` before extraction.
+Extract the verified archives at the repository root; their paths start with
+`output/<prepared-folder>/...` and `output/<run-folder>/...`.
+Use the same original Kaggle working paths listed in `manifest["restore_paths"]`
+and the matching helper version because resume checks deliberately reject changed
+paths/code/settings. Then `pipeline.CompactDataset(RUN)` provides the inputs for
+the downstream GraphLLM classifier (ExplaGraphs) or QA task (WebQSP).
+The existing training registry still needs that explicit adapter.
+
+The upload happens only when the final cell executes; it cannot protect an
+unfinished run if Kaggle kills the session earlier. Keep Kaggle Save Version /
+Dataset outputs as an additional backup. Drive quota or authentication/network
+errors stop explicitly and leave the local outputs intact for retry.
+Live OAuth/Drive access requires your account and cannot be verified locally
+without it. The offline upload/archive regression tests use a fake Drive service:
+
+```bash
+python -m unittest discover -s tests -p 'test_*preprocess.py'
+python -m unittest discover -s tests -p test_drive_backup.py
+```
+
+## Legacy full-cache workflow (reference only)
+
+The remaining sections describe the older, much larger on-disk format and the
+original training path. **Do not run Stages A-D below after the compact notebook**
+unless you intentionally want a separate full-cache experiment. They are not
+required by either updated notebook.
+
 ## Scope and reproducibility
 
 These instructions move dataset download and preprocessing to Kaggle; no local
