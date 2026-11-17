@@ -76,21 +76,21 @@ flowchart LR
 **(Eq. 1) Autoregressive generation conditioned on retrieved subgraph**
 
 $$
-p_\theta(Y\mid[q,\hat g])=\prod_{i=1}^{n} p_\theta(y_i\mid y_{<i},[q,\hat g])
+p_\theta(Y \mid [q, \hat{g}]) = \prod_{i=1}^{n} p_\theta(y_i \mid y_{\lt i}, [q, \hat{g}])
 $$
 
 **(Eq. 2) Retrieve optimal subgraph (NP-hard form)**
 
 $$
-\max_{\hat g} f(\hat g) = \max_{V_{\text{key}}} f\left(\bigcup_{v\in V_{\text{key}}} G[N_K^*(v)]\right)
+\max_{\hat{g}} f(\hat{g}) = \max_{V_{\text{key}}} f\left(\bigcup_{v \in V_{\text{key}}} G[N_K^*(v)]\right)
 $$
 
 **(Eq. 3) Divide-and-conquer approximation used by GRAG**
 
 $$
-\max_{V_{\text{key}}} f\left(\bigcup_{v\in V_{\text{key}}} G[N_K^*(v)]\right)
+\max_{V_{\text{key}}} f\left(\bigcup_{v \in V_{\text{key}}} G[N_K^*(v)]\right)
 \approx
-\max_{V_{\text{key}}} \sum_{v\in V_{\text{key}}} f\left(G[N_K^*(v)]\right)
+\max_{V_{\text{key}}} \sum_{v \in V_{\text{key}}} f\left(G[N_K^*(v)]\right)
 $$
 
 ```mermaid
@@ -282,7 +282,7 @@ Code behavior: `graph_encoder` + `projector` in [src/model/graph_llm.py:110](src
 
 $$
 p_{\theta,\phi_1,\phi_2,\phi_3,\Phi}(Y\mid q,G)
-=\prod_{i=1}^{n} p_{\theta,\phi_1,\phi_2,\phi_3,\Phi}\left(y_i\mid y_{<i},[h_{\hat g};h_T]\right)
+=\prod_{i=1}^{n} p_{\theta,\phi_1,\phi_2,\phi_3,\Phi}\left(y_i\mid y_{\lt i},[h_{\hat{g}};h_T]\right)
 $$
 
 Code behavior: prepend graph token embedding before text embeddings in [src/model/graph_llm.py:150](src/model/graph_llm.py#L150), [src/model/graph_llm.py:202](src/model/graph_llm.py#L202).
