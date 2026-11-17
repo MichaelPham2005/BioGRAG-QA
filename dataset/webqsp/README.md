@@ -3,12 +3,14 @@
 ## Scope and reproducibility
 
 These instructions move dataset download and preprocessing to Kaggle; no local
-Mac training environment is required. They propose a Python 3.10 environment
-isolated from Kaggle's changing preinstalled packages. The original dependency
-instructions use Python 3.9, PyTorch 2.0.1 and CUDA 11.8; see
-[requirements.txt](../../requirements.txt). The additional pins in
-[requirements-kaggle.txt](../../requirements-kaggle.txt) are a compatibility
-starting point, **not an authors-provided lockfile or a GPU-tested environment**.
+Mac training environment is required. They use **Kaggle's preinstalled Python
+environment** and install only the packages that are missing, instead of
+rebuilding the authors' environment (Python 3.9, PyTorch 2.0.1, CUDA 11.8; see
+[requirements.txt](../../requirements.txt)). Package versions therefore differ
+from the paper's setup and Kaggle updates them over time. Preprocessing is
+simple tensor/CSV work and should be insensitive to this, but nothing here is a
+GPU-tested environment. [requirements-kaggle.txt](../../requirements-kaggle.txt)
+is an optional pinned set for training, **not an authors-provided lockfile**.
 
 The paper used four NVIDIA A10G GPUs. Two 16 GB T4s are not one 32 GB GPU, and
 training with the repository unchanged is not guaranteed to fit or run.
@@ -27,8 +29,8 @@ substantial disk space. Start with the one-sample smoke check, not the full job.
   read-only `/kaggle/input`.
 
 The following are notebook cells. They use subprocesses with `check=True` so a
-failed command stops explicitly. The notebook kernel stays unchanged; every
-GRAG command runs using the separate environment's Python executable.
+failed command stops explicitly. GRAG commands run in subprocesses with the
+notebook's own Python (`sys.executable`).
 
 ### Clone the working branch
 
@@ -53,88 +55,46 @@ print(subprocess.check_output(
 Run the clone once in a fresh session. If the folder already exists, inspect it
 rather than deleting it or cloning over it.
 
-### Create an isolated environment
+### Use Kaggle's environment
 
 ```python
-import shutil
-import subprocess
-import sys
-from pathlib import Path
+import subprocess, sys
 
-UV = shutil.which("uv")
-if UV is None:
-    tools = Path("/kaggle/working/grag-tools")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--target", str(tools), "uv"],
-        check=True,
-    )
-    UV = str(tools / "bin" / "uv")
-    if not Path(UV).is_file():
-        raise FileNotFoundError(f"uv installation did not create {UV}")
-
-subprocess.run([UV, "--version"], check=True)
-
-ENV = Path("/kaggle/working/grag-venv")
-PY = str(ENV / "bin/python")
+PY = sys.executable
 subprocess.run(
-    [UV, "venv", "--python", "3.10", str(ENV)],
+    [PY, "-m", "pip", "install", "-q", "torch_geometric", "gensim"],
     check=True,
-)
-
-def install(*args):
-    subprocess.run(
-        [UV, "pip", "install", "--python", PY, *args],
-        cwd=ROOT, check=True,
-    )
-
-install("torch==2.0.1", "--index-url", "https://download.pytorch.org/whl/cu118")
-install("-r", "requirements-kaggle.txt")
-install(
-    "torch-scatter==2.1.2+pt20cu118",
-    "--find-links", "https://data.pyg.org/whl/torch-2.0.1+cu118.html",
-    "--only-binary", "torch-scatter",
-)
-subprocess.run(
-    [UV, "pip", "check", "--python", PY], check=True
 )
 
 def run(code):
     subprocess.run([PY, "-u", "-c", code], cwd=ROOT, check=True)
 ```
 
-Use the resolved `UV` executable throughout, not `sys.executable -m uv`.
-Kaggle may have `uv` on `PATH` without the `uv` Python module being installed
-in the notebook kernel's interpreter. If the executable is missing, the cell
-installs it into the writable `/kaggle/working/grag-tools` directory rather
-than modifying the system Python environment.
+Kaggle already provides `torch`, `transformers`, `datasets`, `pandas`,
+`scikit-learn`, `networkx` and `joblib`. Preprocessing (Stages A-D) also needs
+`torch_geometric` and `gensim` (imported by
+[lm_modeling.py](../../src/utils/lm_modeling.py)), installed above. Training
+additionally needs `peft`, `torch_scatter` and `wandb`; install those only when
+you reach training (see the end of this guide), because `torch_scatter` wheels
+must match Kaggle's torch/CUDA versions.
 
-The IPython warning `History will not be written to the database` is separate:
-it concerns notebook input-history storage, not the GRAG environment or dataset.
-It does not explain `No module named uv`. If it persists, save the notebook and
-restart the Kaggle session; do not change permissions on shared system files.
-
-This installs the `torch_scatter` extension actually imported by
-[GraphLLM](../../src/model/graph_llm.py#L6). The original requirements also list
-other PyG extensions; add them only if a chosen operation reports a missing
-extension. `torchvision` and `torchaudio` are not used in this WebQSP flow.
+The IPython warning `History will not be written to the database` concerns
+notebook input-history storage, not the dataset or packages. If it persists,
+save the notebook and restart the session.
 
 ### Validate the environment before downloading models
 
 ```python
 run("""
-import torch, datasets, transformers, peft, gensim
-from torch_scatter import scatter
+import torch, datasets, transformers, gensim, networkx, joblib, sklearn
 from torch_geometric.nn import GATConv
-print("torch:", torch.__version__)
-print("CUDA:", torch.version.cuda)
+print("torch:", torch.__version__, "CUDA:", torch.version.cuda)
+print("transformers:", transformers.__version__, "datasets:", datasets.__version__)
 assert torch.cuda.is_available(), "Enable the Kaggle GPU accelerator."
-assert torch.cuda.device_count() == 2, "Select T4 x2."
-for i in range(2):
+print("GPUs:", torch.cuda.device_count())
+for i in range(torch.cuda.device_count()):
     p = torch.cuda.get_device_properties(i)
     print(i, p.name, round(p.total_memory / 2**30, 2), "GiB")
-x = torch.ones(3, 2, device="cuda")
-batch = torch.tensor([0, 0, 1], device="cuda")
-assert scatter(x, batch, dim=0, reduce="mean").shape == (2, 2)
 conv = GATConv(4, 4, heads=2, concat=False).cuda()
 out = conv(torch.ones(2, 4, device="cuda"),
            torch.tensor([[0, 1], [1, 0]], device="cuda"))
@@ -143,8 +103,7 @@ print("Imports and basic CUDA graph operations passed.")
 """)
 ```
 
-Do not continue if this fails. Save the error and the printed package/GPU
-versions; successfully installing packages is not proof of GPU compatibility.
+Do not continue if this fails. Save the error and the printed versions.
 
 ## 2. Download and inspect the raw dataset
 
@@ -338,25 +297,78 @@ measured ~52 s per graph (~67 h) on a T4. The sharded variant
 process per GPU, embeds each unique string once per graph, and skips finished
 graphs so it can be restarted. Stop the running `step_two` cell first.
 
+**1. Launch (run once).** It refuses to start if workers are already running,
+because two workers on the same shard corrupt each other's output.
+
 ```python
 import os, subprocess
 
+stale = subprocess.run(["pgrep", "-f", "webqsp_sharded"],
+                       capture_output=True, text=True).stdout.split()
+if stale:
+    raise RuntimeError(f"Workers already running: PIDs {stale}. "
+                       "Use the stop cell below first.")
+
+NUM_SHARDS = 2
 procs = []
-for shard in range(2):
+for shard in range(NUM_SHARDS):
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(shard)}
     log = open(f"/kaggle/working/embed_shard{shard}.log", "w")
     procs.append(subprocess.Popen(
         [PY, "-u", "-m", "src.dataset.preprocess.webqsp_sharded",
-         "--shard", str(shard), "--num_shards", "2",
+         "--shard", str(shard), "--num_shards", str(NUM_SHARDS),
          "--batch_size", "64", "--fp16"],
         cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
     ))
+print("launched PIDs:", [p.pid for p in procs])
 ```
 
-Monitor with `!tail -c 300 /kaggle/working/embed_shard0.log`, and wait with
-`[p.wait() for p in procs]` (all return codes must be 0). `--fp16` changes
-embeddings by small floating-point amounts; drop it for strict numerical
-fidelity (slower). Outputs are the same files as `step_two`.
+**2. Live status.** Prints progress every 30 s until both workers finish (or
+one fails). Interrupting this cell does not stop the workers; rerun it to
+resume watching.
+
+```python
+import re, time
+from pathlib import Path
+
+total = 4700
+graphs = Path(ROOT) / "dataset/webqsp/graphs"
+while True:
+    codes = [p.poll() for p in procs]
+    done = len(list(graphs.glob("*.pt")))
+    gpu = subprocess.run(
+        ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+         "--format=csv,noheader"], capture_output=True, text=True).stdout.split("\n")
+    last = []
+    for s in range(NUM_SHARDS):
+        txt = open(f"/kaggle/working/embed_shard{s}.log", errors="replace").read()
+        bars = re.findall(r"shard \d+:[^\r\n]*", txt.replace("\r", "\n"))
+        last.append(bars[-1] if bars else "(no progress yet)")
+    print(time.strftime("%H:%M:%S"), f"graphs {done}/{total}", "exit:", codes)
+    for s, l in enumerate(last):
+        print(f"  {l}   GPU: {gpu[s].strip()}")
+    if any(c not in (None, 0) for c in codes):
+        raise RuntimeError("A worker failed; read /kaggle/working/embed_shard*.log")
+    if all(c == 0 for c in codes):
+        break
+    time.sleep(30)
+print("all workers finished")
+```
+
+Both exit codes must be `0`. If the kernel restarts, `procs` is lost but any
+workers keep running: check with `pgrep -f webqsp_sharded`, count
+`graphs/*.pt` yourself, or stop and relaunch (finished graphs are skipped).
+
+**Stop stray workers** (e.g. after launching twice, or before relaunching):
+
+```python
+subprocess.run(["pkill", "-f", "webqsp_sharded"])
+```
+
+Then run the validation cell below, then Stage D.
+
+`--fp16` changes embeddings by small floating-point amounts; drop it for
+strict numerical fidelity (slower). Outputs are the same files as `step_two`.
 
 Original single-GPU version:
 
@@ -497,7 +509,7 @@ cached graphs, and cached descriptions together, plus:
 ```python
 with open("/kaggle/working/grag-environment.txt", "w") as f:
     subprocess.run(
-        [UV, "pip", "freeze", "--python", PY],
+        [PY, "-m", "pip", "freeze"],
         stdout=f, check=True,
     )
 ```
@@ -516,6 +528,10 @@ python train.py --dataset webqsp --model_name graph_llm --llm_frozen True --seed
 ```
 
 This is a reference command, **not a verified T4-ready training command**.
+Before training, install the extra packages (not needed for preprocessing),
+e.g. `pip install peft wandb`, and a `torch_scatter` wheel matching Kaggle's
+installed torch/CUDA from <https://data.pyg.org/whl/>; the authors used
+`torch-scatter 2.1.2` with torch 2.0.1.
 The following need a separate, tested compatibility pass:
 
 1. [GraphLLM model loading](../../src/model/graph_llm.py#L32) hard-codes
@@ -534,11 +550,11 @@ The following need a separate, tested compatibility pass:
 5. Access to `meta-llama/Llama-2-7b-hf` is gated. To authenticate the subprocesses,
    load the Kaggle Secret into the notebook environment without printing it:
 
-   ```python
-   import os
-   from kaggle_secrets import UserSecretsClient
-   os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
-   ```
+```python
+import os
+from kaggle_secrets import UserSecretsClient
+os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+```
 
 6. W&B needs configuration. Use `os.environ["WANDB_MODE"] = "offline"` if you do
    not want online logging. Do not embed API keys in the notebook.

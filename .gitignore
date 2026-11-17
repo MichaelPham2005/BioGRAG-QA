@@ -14,3 +14,4 @@ dataset/webqsp/cached_graphs/
 dataset/webqsp/cached_desc/
 output/
 wandb/
+.DS_Store

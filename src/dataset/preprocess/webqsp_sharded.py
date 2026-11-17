@@ -74,8 +74,9 @@ def main():
         graph = Data(x=x, edge_index=edge_index, edge_attr=edge_attr,
                      num_nodes=len(nodes))
         graph = remove_repeated_edges_tensor(graph)
-        torch.save(graph, out + ".tmp")
-        os.replace(out + ".tmp", out)
+        tmp = f"{out}.{os.getpid()}.tmp"  # unique per process
+        torch.save(graph, tmp)
+        os.replace(tmp, out)
 
 
 if __name__ == "__main__":
