@@ -329,6 +329,40 @@ class DownstreamTests(unittest.TestCase):
         samples["question"] = ["q" * 500]
         self.assertEqual(model.input_batch(samples, supervised=True)["inputs_embeds"].shape[1], 1024)
 
+    def test_full_graph_notebook_keeps_description_and_rejects_any_truncation(self):
+        from types import SimpleNamespace
+
+        path = ROOT / "notebook/kaggle/grag-expla-graphs-full-graph.ipynb"
+        notebook = json.loads(path.read_text())
+        tree = ast.parse("".join(next(c for c in notebook["cells"] if c["id"] == "model")["source"]))
+        constructor = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                           and isinstance(node.func, ast.Attribute) and node.func.attr == "Settings")
+        settings = eval(compile(ast.Expression(constructor), "<notebook-settings>", "eval"), {
+            "training": training, "DATASET": "expla_graphs", "MODEL_ID": "local-test",
+            "model_revision": "model-sha", "SMOKE_TEST": False,
+            "config": SimpleNamespace(max_position_embeddings=4096),
+        })
+        guard = next(node for node in tree.body if isinstance(node, ast.If)
+                     and "split_report" in ast.unparse(node.test))
+        check = compile(ast.Module(body=[guard], type_ignores=[]), "<full-text-guard>", "exec")
+        model = self.tiny_model()
+        model.settings = settings
+        samples = artifacts.collate([self.dataset[0]])
+        samples["desc"] = ["d" * 700]
+        row = {key: value[0] for key, value in samples.items() if key != "graph"}
+        dataset = SimpleNamespace(read_payload=lambda index: row)
+        report = training.token_report(model, dataset, [0])
+        self.assertEqual(report, {"answer_targets_truncated": 0, "descriptions_truncated": 0})
+        exec(check, {"report": {"train": report}})
+        inputs = model.input_batch(samples, supervised=True)
+        question = len(model.tokenizer.encode(samples["question"][0]))
+        self.assertEqual(inputs["inputs_embeds"].shape[1], 2 + 1 + 700 + question + 1 + 2)
+        row["desc"] = "d" * 4096
+        report = training.token_report(model, dataset, [0])
+        self.assertEqual(report["descriptions_truncated"], 1)
+        with self.assertRaisesRegex(ValueError, "every graph to fit intact"):
+            exec(check, {"report": {"test": report}})
+
     def test_newer_best_checkpoint_survives_older_progress_and_retries_backup(self):
         output, drive, _, history = self.fit_scalar(ScalarModel(self.settings), "ahead")
         best = torch.load(output / "best.pt", weights_only=True)
@@ -362,7 +396,8 @@ class DownstreamTests(unittest.TestCase):
         if not expla.exists():
             expla = ROOT / "notebook/colab/grag_expla_graphs_downstream.ipynb"
         for path in (expla, ROOT / "notebook/colab/grag-webqsp-downstream.ipynb",
-                     ROOT / "notebook/kaggle/grag-webqsp-downstream.ipynb"):
+                     ROOT / "notebook/kaggle/grag-webqsp-downstream.ipynb",
+                     ROOT / "notebook/kaggle/grag-expla-graphs-full-graph.ipynb"):
             notebook = json.loads(path.read_text())
             import nbformat
             nbformat.validate(nbformat.from_dict(notebook))

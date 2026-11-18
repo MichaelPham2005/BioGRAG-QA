@@ -5,6 +5,7 @@ from contextlib import redirect_stdout
 import json
 from pathlib import Path
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -152,6 +153,192 @@ class CompactRetrievalTests(unittest.TestCase):
         restored = torch.load(io.BytesIO(compact.getvalue()), weights_only=True)
         torch.testing.assert_close(pipeline.materialize(restored)["graph"].x,
                                    pipeline.materialize(payload)["graph"].x)
+
+
+class FullGraphTests(unittest.TestCase):
+    def setUp(self):
+        from src.utils.notebook_preprocessing import expla_full_graph
+        from src.utils.notebook_downstream import artifacts
+
+        self.full_graph, self.artifacts = expla_full_graph, artifacts
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.prepared, self.run = self.root / "prepared", self.root / "full-run"
+        # A long chain, a parallel edge, an exact repeated edge and a self-loop.
+        self.graph = "".join(f"(N{i}; R; N{i+1})" for i in range(13))
+        self.graph += "(N0; S; N1)(N0; R; N1)(N2; R; N2)"
+        self.raw = self.root / "train_dev.tsv"
+        pd.DataFrame([
+            {"arg1": f"first {i}", "arg2": f"second {i}",
+             "label": "support" if i % 2 else "counter", "graph": self.graph}
+            for i in range(10)
+        ]).to_csv(self.raw, sep="\t", index=False)
+        pipeline.prepare("expla_graphs", self.prepared, raw=self.raw)
+        self.config = expla_full_graph.configure_run(
+            self.prepared, self.run, model_revision="a" * 40,
+        )
+        self.metadata, self.records = pipeline.read_prepared(self.prepared)
+        self.config_hash = pipeline.digest(self.run / "config.json")
+
+    @staticmethod
+    def encode(texts):
+        ids = torch.tensor([sum(text.encode()) % 1024 for text in texts], dtype=torch.long)
+        return torch.nn.functional.one_hot(ids, num_classes=1024).float()
+
+    def write_samples(self):
+        for record in self.records:
+            nodes, edges = pipeline.load_tables(self.prepared, record, "expla_graphs")
+            payload = self.full_graph.encode_record(
+                record, nodes, edges, self.encode, self.config_hash, "a" * 40,
+            )
+            torch.save(payload, self.run / "samples" / f"{record['id']}.pt")
+        return self.artifacts.CompactTrainingDataset(self.prepared, self.run)
+
+    def test_full_graph_matches_author_tables_description_splits_and_per_row_query(self):
+        # Execute only the author's pure textualizer, avoiding its top-level I/O/model imports.
+        author = ast.parse((ROOT / "src/dataset/preprocess/expla_graphs.py").read_text())
+        textualizer = next(node for node in author.body
+                           if isinstance(node, ast.FunctionDef) and node.name == "textualize_graph")
+        namespace = {"pd": pd, "re": re}
+        exec(compile(ast.Module(body=[textualizer], type_ignores=[]), "<author-textualizer>", "exec"),
+             namespace)
+        author_nodes, author_edges = namespace["textualize_graph"](self.graph)
+        author_split = self.artifacts.load_source("full_graph_author_split", ROOT / "src/utils/generate_split.py")
+        author_split.generate_split(10, self.root / "author-splits")
+        for name in ("train", "val", "test"):
+            expected = [int(line) for line in
+                        (self.root / "author-splits" / f"{name}_indices.txt").read_text().splitlines()]
+            self.assertEqual(self.metadata["splits"][name], expected)
+        with patch.object(pipeline, "retrieve_compact", side_effect=AssertionError("No retrieval")), \
+                patch("src.utils.notebook_preprocessing.kaggle_preprocess.retrieve_compact",
+                      side_effect=AssertionError("No retrieval")):
+            dataset = self.write_samples()
+            self.full_graph.validate_dataset(dataset)
+        sample = dataset[0]
+        graph = sample["graph"]
+        expected_description = (author_nodes.to_csv(index=False, columns=["node_id", "node_attr"])
+                                + "\n" + author_edges.to_csv(index=False))
+        self.assertEqual(sample["desc"], expected_description)
+        self.assertEqual((graph.num_nodes, graph.num_edges), (14, 16))
+        torch.testing.assert_close(graph.edge_index, torch.tensor([author_edges.src, author_edges.dst]))
+        torch.testing.assert_close(graph.x, self.encode(author_nodes.node_attr.tolist()))
+        torch.testing.assert_close(graph.edge_attr, self.encode(author_edges.edge_attr.tolist()))
+        torch.testing.assert_close(graph.question_node, self.encode([self.records[0]["question"]]).repeat(14, 1))
+        self.assertFalse(torch.equal(dataset[0]["graph"].question_node[0], dataset[1]["graph"].question_node[0]))
+        self.assertEqual(dataset.config["pipeline"], "expla_full_graph")
+        self.assertEqual(self.metadata["excluded_count"], 0)
+
+    def test_full_graph_snapshot_round_trip_and_mutation_rejection(self):
+        from src.utils.notebook_preprocessing.drive_backup import collect_files, write_archive
+
+        self.write_samples()
+        manifest, files = collect_files(self.prepared, self.run)
+        snapshot = self.root / "snapshot"
+        snapshot.mkdir()
+        archive = snapshot / "part-00000.tar.gz"
+        write_archive(files, archive)
+        manifest["archives"] = [{"name": archive.name, "size": archive.stat().st_size,
+                                 "sha256": pipeline.digest(archive)}]
+        self.artifacts.atomic_json(manifest, snapshot / "manifest.json")
+        prepared, run, _ = self.artifacts.restore_snapshot(snapshot, self.root / "restored", "expla_graphs")
+        restored = self.artifacts.CompactTrainingDataset(prepared, run)
+        self.full_graph.validate_dataset(restored)
+        changed = restored.read_payload(0)
+        changed["desc"] = "only some nodes"
+        torch.save(changed, run / "samples/0.pt")
+        with self.assertRaisesRegex(ValueError, "lost, reordered or changed"):
+            self.full_graph.validate_dataset(restored)
+        changed["pipeline"] = "retrieval"
+        nodes, edges = pipeline.load_tables(prepared, self.records[0], "expla_graphs")
+        with self.assertRaisesRegex(ValueError, "lost, reordered or changed"):
+            self.full_graph.validate_record(changed, self.records[0], nodes, edges,
+                                            self.config_hash, "a" * 40)
+
+    def test_resume_rejects_settings_or_source_changes(self):
+        self.assertEqual(self.full_graph.configure_run(
+            self.prepared, self.run, model_revision="a" * 40,
+        ), self.config)
+        with self.assertRaisesRegex(ValueError, "settings/data/code changed"):
+            self.full_graph.configure_run(self.prepared, self.run, model_revision="b" * 40)
+        with patch.object(self.full_graph.preprocessing, "digest", return_value="changed-code"):
+            with self.assertRaisesRegex(ValueError, "original full-graph preprocessing code"):
+                self.full_graph.worker(self.run, 0)
+
+    def test_notebook_receipt_restores_exact_snapshot_without_reembedding(self):
+        from src.utils.notebook_downstream import drive_sync, training
+        from src.utils.notebook_preprocessing import drive_backup
+        from tests.test_drive_sync import Download, MutableDrive
+
+        class Media(bytes):
+            def execute(self):
+                return bytes(self)
+
+        class NotebookDrive(MutableDrive):
+            def get_media(self, fileId):
+                return Media(super().get_media(fileId))
+
+        class LocalEncoder:
+            revision = "a" * 40
+
+            def __init__(self, config, device):
+                pass
+
+            __call__ = staticmethod(self.encode)
+
+        checkout = self.root / "checkout"
+        self.artifacts.backup_file(self.raw, checkout / "dataset/expla_graphs/train_dev.tsv")
+        drive = NotebookDrive()
+        store = drive_sync.DriveFolder(drive, "training", self.root / "drive-cache")
+        output = checkout / "output/downstream/expla_graphs/full-graph"
+        output.mkdir(parents=True)
+        spawned = []
+
+        def launch(command, **kwargs):
+            shard = int(command[-1])
+            self.assertEqual(kwargs["env"]["CUDA_VISIBLE_DEVICES"], str(shard))
+            spawned.append(shard)
+            self.full_graph.worker(Path(command[command.index("--output") + 1]), shard)
+            return types.SimpleNamespace(poll=lambda: 0, wait=lambda timeout: 0)
+
+        def notebook_path(value):
+            # Keep the notebook's Kaggle caches inside this test's temporary directory.
+            if str(value).startswith("/kaggle/temp/"):
+                return self.root / str(value).removeprefix("/")
+            return Path(value)
+
+        notebook = json.loads((ROOT / "notebook/kaggle/grag-expla-graphs-full-graph.ipynb").read_text())
+        cell = next(cell for cell in notebook["cells"] if cell["id"] == "preprocessing")
+        code = compile("".join(cell["source"]), "<full-graph-preprocessing-cell>", "exec")
+        namespace = {
+            "Path": notebook_path, "ROOT": checkout, "OUTPUT": output, "DRIVE_OUTPUT": store.cache,
+            "drive_store": store, "service": drive, "DATASET": "expla_graphs", "SMOKE_TEST": True,
+            "full_graph": self.full_graph, "preprocessing": self.full_graph.preprocessing,
+            "artifacts": self.artifacts, "training": training, "json": json, "os": os, "sys": sys,
+            "subprocess": types.SimpleNamespace(Popen=launch, STDOUT=subprocess.STDOUT),
+            "HfApi": lambda: types.SimpleNamespace(model_info=lambda model: types.SimpleNamespace(sha="a" * 40)),
+            "COMMIT": "test-code", "requirements": {}, "version": lambda name: "test",
+            "backup_to_drive": drive_backup.backup_to_drive, "find_remote": drive_backup.find_remote,
+            "restore_drive_snapshot": drive_sync.restore_drive_snapshot,
+        }
+        with patch.object(drive_backup, "upload_media", side_effect=lambda path: path), \
+                patch.object(drive_sync, "upload_media", side_effect=lambda path: path), \
+                patch("googleapiclient.http.MediaIoBaseDownload", Download), \
+                patch.object(self.full_graph.preprocessing, "Encoder", LocalEncoder), \
+                patch.object(torch.cuda, "is_available", return_value=True):
+            exec(code, namespace)
+            first_hash = namespace["dataset"].config_hash
+            self.assertEqual(spawned, [0, 1])
+            self.assertEqual(len(namespace["dataset"]), 10)
+            receipt = json.loads((store.cache / "preprocessing.json").read_text())
+            self.assertEqual(receipt["snapshot_sha256"], namespace["SNAPSHOT_HASH"])
+            fresh = drive_sync.DriveFolder(drive, "training", self.root / "fresh-cache")
+            fresh.download("preprocessing.json")
+            namespace.update(DRIVE_OUTPUT=fresh.cache, drive_store=fresh)
+            namespace["subprocess"].Popen = lambda *args, **kwargs: self.fail("Snapshot restore reran embeddings")
+            exec(code, namespace)
+            self.assertEqual(namespace["dataset"].config_hash, first_hash)
+            self.assertEqual(namespace["SNAPSHOT_HASH"], receipt["snapshot_sha256"])
 
 
 class EncoderTests(unittest.TestCase):

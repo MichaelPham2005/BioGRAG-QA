@@ -339,8 +339,11 @@ and evaluation helpers. It does not rerun preprocessing.
 
 Enable Internet and **T4 x2**, accept the gated Llama-2 license, and enable Kaggle
 Secrets `HF_TOKEN`, `GDRIVE_CLIENT_ID`, `GDRIVE_CLIENT_SECRET`, and
-`GDRIVE_REFRESH_TOKEN`. Fill in the completed preprocessing snapshot folder ID and
-the existing **GRAG downstream** MyDrive folder ID in section 3.
+`GDRIVE_REFRESH_TOKEN`. Section 3 automatically finds the same MyDrive folders as
+Colab: **GRAG preprocessing backups** and **GRAG downstream**. Leave the folder-ID
+overrides as `None`; if several completed WebQSP snapshots exist, select an ID
+from the printed candidates. Missing/duplicate roots stop rather than creating
+replacement folders.
 
 Kaggle has no Colab-style Drive filesystem mount. The
 [Drive API adapter](../../src/utils/notebook_downstream/drive_sync.py) downloads
@@ -359,6 +362,38 @@ the resulting refresh token in Kaggle Secrets. This grants broad Drive access;
 review that permission before authorizing it. The notebook cannot expand an
 existing token's grant and stops if authentication/folder access fails.
 It never creates a substitute `GRAG downstream` root.
+
+### Repairing Drive authentication
+
+A failure at `credentials.refresh(Request())` happens **before folder discovery**;
+changing folder IDs or leaving them as `None` cannot fix it. Section 3 reports
+recognized OAuth errors without printing raw responses or secret values:
+
+- `invalid_scope`: the refresh token cannot request the full Drive scope.
+  A preprocessing `drive.file` token cannot acquire broader access just by
+  changing the notebook's `scopes` argument.
+- `invalid_grant`: the token may be expired/revoked or belong to a different
+  client. Drive tokens from apps in Testing can expire after seven days.
+- Client rejected: all three Google secrets must belong to the same desktop
+  OAuth client/token pair.
+- Temporary server errors: retry later before replacing credentials.
+
+If you accept full Drive access, repeat the
+[local OAuth setup](#one-time-oauth-setup-on-your-own-computer-not-inside-kaggle)
+with these two changes:
+
+1. Declare `https://www.googleapis.com/auth/drive` in Google Auth Platform's
+   Data Access, and use that exact scope in `InstalledAppFlow` instead of
+   `drive.file`. Sign in with the account containing your existing Colab folders.
+2. Save to a **new private file**, for example `drive-full-token.json`, instead
+   of overwriting the preprocessing token. Keep `access_type="offline"` and
+   `prompt="consent"`.
+
+In Kaggle Secrets, replace `GDRIVE_REFRESH_TOKEN` with the new file's
+`refresh_token`; ensure `GDRIVE_CLIENT_ID` and `GDRIVE_CLIENT_SECRET` match the
+client used for that consent. Enable all three secrets for this notebook and
+rerun Section 3. Never share the token file, values, or raw OAuth error responses.
+This repair does not require rerunning preprocessing or changing Drive folders.
 
 The full configuration is **10 total epochs, patience 4**, microbatch 1 and
 accumulation 4. Description text is capped at **512 tokens**, answers at **64 new
@@ -392,6 +427,67 @@ These cover tiny real Llama/PEFT gradient flow, the longer token budget, explici
 device-map forwarding, checkpoint callbacks, mutable Drive upload/retry/download
 integrity, snapshot restore and notebook syntax. Actual two-T4 NF4 training, gated
 HF access and account-specific Google OAuth require validation on Kaggle.
+
+## ExplaGraphs full-graph experiment on Kaggle
+
+The [end-to-end full-graph notebook](../../notebook/kaggle/grag-expla-graphs-full-graph.ipynb)
+preprocesses the checked-in ExplaGraphs TSV, trains, and evaluates the held-out
+test split in one Kaggle workflow. Unlike the earlier retrieval adaptation, it
+uses the original dataset loader's **whole explanation graph and complete CSV
+description**: no two-hop extraction, relevance ranking, top-k pruning or merging.
+The [full-graph producer](../../src/utils/notebook_preprocessing/expla_full_graph.py)
+reuses the existing parser and sentence encoder, preserves all directed edge
+occurrences (including repeated/parallel edges), and verifies every node/edge
+against its source tables. Per-row questions follow the original dataset loader;
+the original preprocessing script's accidental full-column question formatting
+is not reproduced. The repository's 60/20/20 split procedure and seed 42 are
+unchanged.
+
+The checked-in TSV contains 2,766 examples: 1,659 train, 553 validation and
+554 test. A source-table audit retains all 11,745 directed edge occurrences with
+zero exclusions.
+
+Enable Internet, two T4s, and the same HF/full-Drive Kaggle Secrets as above.
+Two independent GPU workers embed the graphs; they exit before the 7B model is
+loaded. Full-data preprocessing is backed up even in smoke mode. The normal
+`GRAG preprocessing backups/expla_graphs-<snapshot-id>` archive/manifest layout is
+retained, and `preprocessing.json` in the downstream run records the exact
+snapshot ID/hash. Restarting restores that snapshot rather than rerunning
+embeddings or accidentally selecting a retrieval backup.
+
+Checkpoints use
+`MyDrive/GRAG downstream/expla_graphs/expla-graphs-full-graph-chat-qlora-kaggle-2t4-<smoke-v1|full-v1>/`.
+Existing checkpoint/history/prediction filenames, verified uploads, partial-epoch
+resume and checkpoint-hash evaluation subfolders are reused. Existing retrieval
+runs and WebQSP training helpers are not modified. For evaluation only, run
+sections 1-5, skip training section 6, and run section 7.
+
+The full configuration uses ten epochs, patience five, batch two and accumulation
+two. `SMOKE_TEST=True` defaults to one epoch on tiny train/val/test subsets; set it
+to `False` in a fresh session for full-data results. The native Llama context is
+checked for **zero graph-description truncation on every split** before model
+loading. Unlike the author's 512-description-token CLI limit, this notebook
+allows the complete graph text up to the native context budget, reserving 32
+answer tokens, and rejects examples that cannot fit intact.
+
+This restores the author's graph pipeline, **not an exact paper-score
+reproduction**: it retains the recent notebooks' chat checkpoint and NF4 QLoRA
+instead of the author's CLI-default frozen unquantized LLM. Modern libraries and
+full-description handling also differ. Compare using the same splits and report
+these settings; do not assume removing retrieval alone recovers the reported
+accuracy. Test metrics never control checkpoint selection.
+
+Focused offline checks:
+
+```bash
+python -m unittest tests.test_kaggle_preprocess.FullGraphTests tests.test_notebook_downstream tests.test_drive_sync tests.test_drive_backup
+```
+
+These compare the full graphs/CSV descriptions and splits with the original
+code, verify that long descriptions are retained or explicitly rejected, and
+execute the notebook's preprocessing/Drive receipt restore with mocked GPU
+embeddings and Drive. Actual gated 7B NF4 training on two T4s still requires
+Kaggle validation.
 
 ## Legacy full-cache workflow (reference only)
 
