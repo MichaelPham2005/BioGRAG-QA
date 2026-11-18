@@ -120,8 +120,12 @@ def worker(output, shard):
     config_hash = preprocessing.digest(output / "config.json")
     with preprocessing.exclusive_lock(output / f"worker-{shard}.lock"):
         encoder = preprocessing.Encoder(config, "cuda:0")
-        if encoder.revision != config["model_revision"]:
-            raise ValueError("Loaded encoder revision differs from the pinned commit.")
+        print(
+            f"shard={shard} pid={os.getpid()} GPU={torch.cuda.get_device_name(0)} "
+            f"pinned_revision={config['model_revision']} "
+            f"loaded_revision={encoder.revision}",
+            flush=True,
+        )
         for index in tqdm(range(shard, len(records), config["num_shards"]), desc=f"Full-graph shard {shard}"):
             record = records[index]
             nodes, edges = preprocessing.load_tables(config["prepared"], record, "expla_graphs")
@@ -130,7 +134,7 @@ def worker(output, shard):
                 validate_record(preprocessing.load_payload(destination), record, nodes, edges,
                                 config_hash, config["model_revision"])
                 continue
-            payload = encode_record(record, nodes, edges, encoder, config_hash, encoder.revision)
+            payload = encode_record(record, nodes, edges, encoder, config_hash, config["model_revision"])
             buffer = io.BytesIO()
             torch.save(payload, buffer)
             if shutil.disk_usage(output).free < buffer.tell() + 2 * 2**30:

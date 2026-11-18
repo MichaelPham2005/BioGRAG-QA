@@ -121,7 +121,7 @@ def find_remote(service, name, parent):
     query = f"name = '{escaped}' and '{parent}' in parents and trashed = false"
     response = service.files().list(
         q=query, spaces="drive", fields="files(id,name,mimeType,md5Checksum,size)",
-        pageSize=2,
+        pageSize=2, supportsAllDrives=True, includeItemsFromAllDrives=True,
     ).execute()
     matches = response.get("files", [])
     if len(matches) > 1:
@@ -138,7 +138,7 @@ def ensure_folder(service, name, parent="root"):
     return service.files().create(
         body={"name": name, "mimeType": "application/vnd.google-apps.folder",
               "parents": [parent]},
-        fields="id",
+        fields="id", supportsAllDrives=True,
     ).execute()["id"]
 
 
@@ -157,7 +157,7 @@ def upload_file(service, path, parent):
     if existing is None:
         request = service.files().create(
             body={"name": path.name, "parents": [parent]},
-            media_body=upload_media(path), fields="id",
+            media_body=upload_media(path), fields="id", supportsAllDrives=True,
         )
         response = None
         while response is None:
@@ -165,7 +165,9 @@ def upload_file(service, path, parent):
         remote_id = response["id"]
     else:
         remote_id = existing["id"]
-    remote = service.files().get(fileId=remote_id, fields="id,md5Checksum,size").execute()
+    remote = service.files().get(
+        fileId=remote_id, fields="id,md5Checksum,size", supportsAllDrives=True,
+    ).execute()
     if remote.get("md5Checksum") != local_md5 or int(remote["size"]) != path.stat().st_size:
         raise ValueError(f"Drive checksum/size mismatch for {path.name}; local outputs are retained.")
     print(f"Drive verified: {path.name} ({path.stat().st_size / 2**20:.1f} MiB)", flush=True)

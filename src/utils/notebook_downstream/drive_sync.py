@@ -45,7 +45,9 @@ class DriveFolder:
         with tempfile.NamedTemporaryFile(dir=self.cache, delete=False) as handle:
             temporary = Path(handle.name)
             try:
-                request = self.service.files().get_media(fileId=remote["id"])
+                request = self.service.files().get_media(
+                    fileId=remote["id"], supportsAllDrives=True,
+                )
                 download = MediaIoBaseDownload(handle, request, chunksize=8 * 1024 * 1024)
                 done = False
                 while not done:
@@ -85,11 +87,12 @@ class DriveFolder:
             if existing is None:
                 request = self.service.files().create(
                     body={"name": destination.name, "parents": [self.folder_id]},
-                    media_body=media, fields="id",
+                    media_body=media, fields="id", supportsAllDrives=True,
                 )
             else:
                 request = self.service.files().update(
                     fileId=existing["id"], media_body=media, fields="id",
+                    supportsAllDrives=True,
                 )
             response = None
             while response is None:
@@ -97,6 +100,7 @@ class DriveFolder:
             remote_id = response["id"]
         remote = self.service.files().get(
             fileId=remote_id, fields="id,size,md5Checksum,parents",
+            supportsAllDrives=True,
         ).execute()
         if (remote.get("md5Checksum") != local_md5
                 or int(remote["size"]) != destination.stat().st_size
