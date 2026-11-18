@@ -7,7 +7,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import warnings
 
 import torch
@@ -264,6 +264,71 @@ class DownstreamTests(unittest.TestCase):
             training.initialize_run(self.settings, self.dataset,
                                     {**self.splits, "test": [0]}, "sha", output, drive)
 
+    def test_external_backup_callback_covers_initialization_training_and_prediction(self):
+        output, drive = self.root / "remote-output", self.root / "remote-cache"
+        backup = Mock(side_effect=artifacts.backup_file)
+        signature = training.initialize_run(
+            self.settings, self.dataset, self.splits, "snapshot", output, drive, backup=backup,
+        )
+        training.fit(ScalarModel(self.settings), self.dataset, self.splits, signature,
+                     output, drive, backup=backup)
+        names = {call.args[1].name for call in backup.call_args_list}
+        self.assertTrue({"run.json", "last.pt", "best.pt", "history.json"}.issubset(names))
+        model = self.tiny_model()
+        training.save_and_backup({"signature": signature, "learned": model.learned_state()},
+                                 "best.pt", output, drive, checkpoint=True, backup=backup)
+        training.predict_test(model, self.dataset, self.splits["test"], signature,
+                              output, drive, backup=backup)
+        names = {call.args[1].name for call in backup.call_args_list}
+        self.assertTrue({"prediction-config.json", "predictions.json", "metrics.json"}.issubset(names))
+        with patch.object(model, "predict", side_effect=AssertionError("Unexpected generation")):
+            training.predict_test(model, self.dataset, self.splits["test"], signature,
+                                  output, drive, backup=backup)
+        failing_backup = Mock(side_effect=OSError("Remote upload failed"))
+        with self.assertRaisesRegex(OSError, "Remote upload failed"):
+            training.save_and_backup({"kept": True}, "retained.json", output, drive,
+                                     backup=failing_backup)
+        self.assertTrue((output / "retained.json").is_file())
+
+    def test_sharded_loader_forwards_map_without_changing_single_gpu_default(self):
+        tokenizer = Tokenizer()
+        llm = Mock()
+        device_map = {"model.embed_tokens": 0, "model.layers.0": 0,
+                      "model.layers.1": 1, "model.norm": 1, "lm_head": 1}
+        with patch.object(training.torch.cuda, "is_available", return_value=True), \
+                patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer), \
+                patch("transformers.AutoModelForCausalLM.from_pretrained", return_value=llm) as load, \
+                patch("transformers.BitsAndBytesConfig"), \
+                patch("peft.prepare_model_for_kbit_training", return_value=llm), \
+                patch("peft.get_peft_model", return_value=llm), \
+                patch.object(training, "ColabGRAG", return_value=llm):
+            training.load_qlora(self.settings, "test-token", device_map=device_map)
+            self.assertEqual(load.call_args.kwargs["device_map"], device_map)
+            training.load_qlora(self.settings, "test-token")
+            self.assertEqual(load.call_args.kwargs["device_map"], {"": 0})
+
+    def test_webqsp_extended_description_and_answer_budget(self):
+        notebook = json.loads((ROOT / "notebook/kaggle/grag-webqsp-downstream.ipynb").read_text())
+        cell = next(cell for cell in notebook["cells"] if cell["id"] == "model")
+        constructor = next(node for node in ast.walk(ast.parse("".join(cell["source"])))
+                           if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                           and node.func.attr == "Settings")
+        budgets = {keyword.arg: ast.literal_eval(keyword.value) for keyword in constructor.keywords
+                   if keyword.arg.startswith("max_")}
+        model = self.tiny_model()
+        model.settings = replace(self.settings, dataset="webqsp", **budgets)
+        model.eval()
+        samples = artifacts.collate([self.dataset[0]])
+        samples["desc"], samples["label"] = ["d" * 800], ["a" * 100]
+        inputs = model.input_batch(samples, supervised=True)
+        prefix = len(model.tokenizer.encode("<s>[INST]", add_special_tokens=False))
+        suffix = len(model.tokenizer.encode("[/INST]", add_special_tokens=False))
+        question = len(model.tokenizer.encode(samples["question"][0], add_special_tokens=False))
+        self.assertEqual(inputs["inputs_embeds"].shape[1], prefix + 1 + 512 + question + suffix + 65)
+        self.assertEqual(int((inputs["labels"] != -100).sum()), 65)
+        samples["question"] = ["q" * 500]
+        self.assertEqual(model.input_batch(samples, supervised=True)["inputs_embeds"].shape[1], 1024)
+
     def test_newer_best_checkpoint_survives_older_progress_and_retries_backup(self):
         output, drive, _, history = self.fit_scalar(ScalarModel(self.settings), "ahead")
         best = torch.load(output / "best.pt", weights_only=True)
@@ -293,8 +358,11 @@ class DownstreamTests(unittest.TestCase):
         web = training.score_predictions("webqsp", [{"prediction": "Paris", "label": "paris|london"}])
         self.assertEqual(web["hit"], 100)
         self.assertEqual(web["answer_coverage"], 50)
-        for name in ("grag-expla-graphs-downstream.ipynb", "grag-webqsp-downstream.ipynb"):
-            path = ROOT / "notebook/colab" / name
+        expla = ROOT / "notebook/colab/grag-expla-graphs-downstream.ipynb"
+        if not expla.exists():
+            expla = ROOT / "notebook/colab/grag_expla_graphs_downstream.ipynb"
+        for path in (expla, ROOT / "notebook/colab/grag-webqsp-downstream.ipynb",
+                     ROOT / "notebook/kaggle/grag-webqsp-downstream.ipynb"):
             notebook = json.loads(path.read_text())
             import nbformat
             nbformat.validate(nbformat.from_dict(notebook))

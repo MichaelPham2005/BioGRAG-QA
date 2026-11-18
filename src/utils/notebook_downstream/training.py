@@ -1,7 +1,8 @@
-"""Colab GRAG + QLoRA training, with lazy graphs and resumable Drive checkpoints."""
+"""GRAG + QLoRA training, with lazy graphs and resumable Drive checkpoints."""
 
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+from functools import partial
 import hashlib
 import json
 import math
@@ -54,12 +55,12 @@ class Settings:
     lora_dropout: float = 0.05
 
 
-def load_qlora(settings, token):
+def load_qlora(settings, token, *, device_map=None):
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
     if not torch.cuda.is_available():
-        raise RuntimeError("Enable a Colab GPU runtime before loading the 4-bit model.")
+        raise RuntimeError("Enable a GPU runtime before loading the 4-bit model.")
     if not settings.model_revision:
         raise ValueError("Pin the gated model revision before loading/training.")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -74,7 +75,9 @@ def load_qlora(settings, token):
             load_in_4bit=True, bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.float16,
         ),
-        torch_dtype=torch.float16, device_map={"": 0}, low_cpu_mem_usage=True,
+        torch_dtype=torch.float16,
+        device_map={"": 0} if device_map is None else device_map,
+        low_cpu_mem_usage=True,
     )
     llm = prepare_model_for_kbit_training(
         llm, use_gradient_checkpointing=True,
@@ -263,7 +266,8 @@ def atomic_checkpoint(value, path):
         temporary.unlink(missing_ok=True)
 
 
-def initialize_run(settings, dataset, splits, snapshot_hash, output, drive_output):
+def initialize_run(settings, dataset, splits, snapshot_hash, output, drive_output,
+                   *, backup=backup_file):
     if (settings.epochs < 1 or settings.batch_size < 1 or settings.grad_accum < 1
             or settings.checkpoint_steps < 1 or settings.gnn_layers < 2
             or settings.patience < 1 or settings.warmup_epochs < 0
@@ -306,17 +310,17 @@ def initialize_run(settings, dataset, splits, snapshot_hash, output, drive_outpu
     if not path.exists() and any((output / name).exists() for name in ("last.pt", "best.pt")):
         raise ValueError("Checkpoint metadata is missing; choose a fresh run directory.")
     atomic_json(manifest, path)
-    backup_file(path, drive_output / path.name)
+    backup(path, drive_output / path.name)
     return signature
 
 
-def save_and_backup(value, name, output, drive_output, checkpoint=False):
+def save_and_backup(value, name, output, drive_output, checkpoint=False, *, backup=backup_file):
     path = Path(output) / name
     if checkpoint:
         atomic_checkpoint(value, path)
     else:
         atomic_json(value, path)
-    backup_file(path, Path(drive_output) / name)
+    backup(path, Path(drive_output) / name)
 
 
 def checkpoint_data(model, optimizer, scaler, signature, state):
@@ -412,7 +416,8 @@ def accumulate_group(model, dataset, indices, parameters, optimizer, scaler, epo
             return loss_sum, len(loader), overflows
 
 
-def fit(model, dataset, splits, signature, output, drive_output):
+def fit(model, dataset, splits, signature, output, drive_output, *, backup=backup_file):
+    save = partial(save_and_backup, backup=backup)
     config = model.settings
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(parameters, lr=config.learning_rate,
@@ -434,7 +439,7 @@ def fit(model, dataset, splits, signature, output, drive_output):
         if model.device.type == "cuda":
             torch.cuda.set_rng_state_all(checkpoint["cuda_rng"])
         random.setstate(checkpoint["python_rng"])
-        backup_file(last, Path(drive_output) / last.name)
+        backup(last, Path(drive_output) / last.name)
         print(f"Resuming epoch {state['epoch']}, next microbatch {state['next_batch']}.")
     best_path = Path(output) / "best.pt"
     if best_path.exists():
@@ -445,7 +450,7 @@ def fit(model, dataset, splits, signature, output, drive_output):
         if best["validation_loss"] < state["best_loss"]:
             state["best_loss"], state["best_epoch"] = best["validation_loss"], best["epoch"]
         del best
-        backup_file(best_path, Path(drive_output) / best_path.name)
+        backup(best_path, Path(drive_output) / best_path.name)
     while state["epoch"] < config.epochs:
         epoch = state["epoch"]
         if state["best_epoch"] >= 0 and epoch - 1 - state["best_epoch"] >= config.patience:
@@ -493,8 +498,8 @@ def fit(model, dataset, splits, signature, output, drive_output):
                 )
                 if state["optimizer_steps"] % config.checkpoint_steps == 0:
                     progress_bar.set_description(f"{description} (Drive backup)")
-                    save_and_backup(checkpoint_data(model, optimizer, scaler, signature, state),
-                                    "last.pt", output, drive_output, checkpoint=True)
+                    save(checkpoint_data(model, optimizer, scaler, signature, state),
+                         "last.pt", output, drive_output, checkpoint=True)
                     progress_bar.set_description(description, refresh=False)
                     tqdm.write(f"Backed up optimizer step {state['optimizer_steps']}.")
         train_seconds = time.monotonic() - epoch_started
@@ -512,13 +517,13 @@ def fit(model, dataset, splits, signature, output, drive_output):
         tqdm.write(f"Epoch {epoch + 1}/{config.epochs}: saving checkpoints and backing up to Drive...")
         if val_loss < state["best_loss"]:
             state["best_loss"], state["best_epoch"] = val_loss, epoch
-            save_and_backup({"signature": signature, "learned": model.learned_state(),
-                             "epoch": epoch, "validation_loss": val_loss},
-                            "best.pt", output, drive_output, checkpoint=True)
+            save({"signature": signature, "learned": model.learned_state(),
+                  "epoch": epoch, "validation_loss": val_loss},
+                 "best.pt", output, drive_output, checkpoint=True)
         state.update(epoch=epoch + 1, next_batch=0, train_loss_sum=0., train_batches=0)
-        save_and_backup(checkpoint_data(model, optimizer, scaler, signature, state),
-                        "last.pt", output, drive_output, checkpoint=True)
-        save_and_backup(state["history"], "history.json", output, drive_output)
+        save(checkpoint_data(model, optimizer, scaler, signature, state),
+             "last.pt", output, drive_output, checkpoint=True)
+        save(state["history"], "history.json", output, drive_output)
         tqdm.write(
             f"Epoch {epoch + 1}/{config.epochs} complete | "
             f"train loss {entry['train_loss']:.4f} | validation loss {val_loss:.4f} | "
@@ -527,7 +532,7 @@ def fit(model, dataset, splits, signature, output, drive_output):
             f"total {tqdm.format_interval(time.monotonic() - epoch_started)} (including backups)"
         )
     load_best(model, output, signature)
-    save_and_backup(state["history"], "history.json", output, drive_output)
+    save(state["history"], "history.json", output, drive_output)
     return state["history"]
 
 
@@ -577,7 +582,8 @@ def score_predictions(dataset, rows):
     }}
 
 
-def predict_test(model, dataset, indices, signature, output, drive_output):
+def predict_test(model, dataset, indices, signature, output, drive_output, *, backup=backup_file):
+    save = partial(save_and_backup, backup=backup)
     load_best(model, output, signature)
     prediction_config = {
         "signature": signature, "best_checkpoint_sha256": checksum(Path(output) / "best.pt"),
@@ -586,7 +592,7 @@ def predict_test(model, dataset, indices, signature, output, drive_output):
     config_path = Path(output) / "prediction-config.json"
     if config_path.exists() and json.loads(config_path.read_text()) != prediction_config:
         raise ValueError("Existing predictions used another checkpoint or test subset.")
-    save_and_backup(prediction_config, config_path.name, output, drive_output)
+    save(prediction_config, config_path.name, output, drive_output)
     path = Path(output) / "predictions.json"
     rows = json.loads(path.read_text()) if path.exists() else []
     seen = {row["id"] for row in rows}
@@ -609,9 +615,9 @@ def predict_test(model, dataset, indices, signature, output, drive_output):
             "label": sample["label"], "prediction": prediction,
         })
         if len(rows) % 10 == 0:
-            save_and_backup(rows, "predictions.json", output, drive_output)
+            save(rows, "predictions.json", output, drive_output)
             print(f"Backed up {len(rows)}/{len(indices)} test predictions.", flush=True)
-    save_and_backup(rows, "predictions.json", output, drive_output)
+    save(rows, "predictions.json", output, drive_output)
     scores = score_predictions(model.settings.dataset, rows)
     manifest = json.loads((Path(output) / "run.json").read_text())
     scores.update(scope=manifest["scope"], evaluation_split="test",
@@ -622,5 +628,5 @@ def predict_test(model, dataset, indices, signature, output, drive_output):
     retained_test_count = len(dataset.metadata["splits"]["test"])
     scores.update(source_test_count=source_test_count, retained_test_count=retained_test_count,
                   excluded_test_count=source_test_count - retained_test_count)
-    save_and_backup(scores, "metrics.json", output, drive_output)
+    save(scores, "metrics.json", output, drive_output)
     return rows, scores

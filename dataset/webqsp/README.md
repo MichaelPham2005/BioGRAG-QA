@@ -229,6 +229,21 @@ deliberately reject changed paths/code/settings. A manual restore needs every
 and file-level verification. Archive paths start with `output/<folder>/...`.
 The original training registry still does not automatically consume compact data.
 
+If section 9 failed only because Kaggle Secrets were disabled, recover the saved
+outputs rather than rerunning preprocessing. The Kaggle output API is paginated;
+verify that every expected compact sample was downloaded, not just the first
+page. Download only the two prepared/run directories and their whitelisted data
+and provenance files, not the cloned checkout, logs or model caches.
+
+For a local, read-only backup of downloaded outputs, validate the original
+metadata, table hashes and compact payloads, then call
+`backup_to_drive(PREPARED, RUN, service, allow_relocated=True)`. This permits the
+original Kaggle path to differ from the local prepared path, while retaining all
+content checksums and the original configuration bytes. Do not edit the producer
+path or hashes to force a preprocessing resume. Keep Kaggle/Google credentials
+outside the repository and delete recovery downloads only after the remote
+manifest and all parts have been verified.
+
 The upload happens only when the final cell executes; it cannot protect an
 unfinished run if Kaggle kills the session earlier. Keep Kaggle Save Version /
 Dataset outputs as an additional backup. Drive quota or authentication/network
@@ -315,6 +330,68 @@ They verify restore integrity, old/new artifact consumption, label masking,
 gradient flow, accumulation/remainder, interrupted resume, generation, metrics,
 backup, and notebook schema/syntax. Live gated-model loading, bitsandbytes on a
 T4, Colab/Drive mounting and full-dataset memory use require remote validation.
+
+## Downstream training on Kaggle (two T4 GPUs)
+
+Use the [Kaggle WebQSP training notebook](../../notebook/kaggle/grag-webqsp-downstream.ipynb).
+It restores the same compact Drive backup and reuses the QLoRA/GAT/projector training
+and evaluation helpers. It does not rerun preprocessing.
+
+Enable Internet and **T4 x2**, accept the gated Llama-2 license, and enable Kaggle
+Secrets `HF_TOKEN`, `GDRIVE_CLIENT_ID`, `GDRIVE_CLIENT_SECRET`, and
+`GDRIVE_REFRESH_TOKEN`. Fill in the completed preprocessing snapshot folder ID and
+the existing **GRAG downstream** MyDrive folder ID in section 3.
+
+Kaggle has no Colab-style Drive filesystem mount. The
+[Drive API adapter](../../src/utils/notebook_downstream/drive_sync.py) downloads
+checksummed inputs and uploads/verifies every checkpoint update. It preserves
+`MyDrive/GRAG downstream/webqsp/<run-name>/`, including `run.json`, `last.pt`,
+`best.pt`, history and token reports. Evaluation outputs use a child folder keyed
+by the best-checkpoint hash, preventing stale predictions after continued training.
+Archive parts are removed from the temporary cache only after verified extraction.
+The frozen model cache is kept outside `/kaggle/working` and is not uploaded to Drive.
+
+**OAuth scope:** the preprocessing-only `drive.file` token may not see
+Colab-created folders or their children. To reuse that existing hierarchy without
+creating duplicate folders, this notebook requires explicitly authorizing
+`https://www.googleapis.com/auth/drive` in your local desktop OAuth flow and storing
+the resulting refresh token in Kaggle Secrets. This grants broad Drive access;
+review that permission before authorizing it. The notebook cannot expand an
+existing token's grant and stops if authentication/folder access fails.
+It never creates a substitute `GRAG downstream` root.
+
+The full configuration is **10 total epochs, patience 4**, microbatch 1 and
+accumulation 4. Description text is capped at **512 tokens**, answers at **64 new
+tokens**, within a **1,024-position total budget** including question, graph token,
+delimiters, answer reserve and EOS. Token-limit reporting measures actual
+train/validation truncations; long answer lists may still be truncated. The model's
+native context is checked before loading, and oversized questions raise an error.
+Smoke mode remains one epoch on small subsets; use `SMOKE_TEST=False` for the
+10-epoch/full-data run after verifying the smoke workflow.
+
+The Llama decoder is explicitly split across GPUs in one process, with embeddings,
+GAT and projector on GPU 0 and the output head on GPU 1. This is **model parallelism,
+not DDP or a pooled 32-GB allocation**. It provides memory headroom but no guaranteed
+speedup or fit for arbitrarily large graphs. CPU/disk offloading is not enabled.
+Resume with two GPUs, identical settings/code and the same run name; `last.pt`
+restores optimizer/scaler, both GPU RNG states and partial-epoch progress.
+Do not run two sessions writing the same Drive run folder.
+
+The new remote-backup callbacks are opt-in: existing Colab calls retain their
+filesystem-copy behavior and single-GPU model placement. Code fingerprints remain
+strict; older runs should retain their original code checkout, not rewrite
+`run.json` to accommodate updated helpers.
+
+Offline checks:
+
+```bash
+python -m unittest tests.test_notebook_downstream tests.test_drive_sync tests.test_drive_backup
+```
+
+These cover tiny real Llama/PEFT gradient flow, the longer token budget, explicit
+device-map forwarding, checkpoint callbacks, mutable Drive upload/retry/download
+integrity, snapshot restore and notebook syntax. Actual two-T4 NF4 training, gated
+HF access and account-specific Google OAuth require validation on Kaggle.
 
 ## Legacy full-cache workflow (reference only)
 

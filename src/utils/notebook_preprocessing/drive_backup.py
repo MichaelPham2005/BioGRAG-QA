@@ -20,7 +20,7 @@ def checksum(path, algorithm="sha256"):
     return value.hexdigest()
 
 
-def collect_files(prepared, run):
+def collect_files(prepared, run, *, allow_relocated=False):
     """Whitelist data/provenance, never upload credentials, logs, or model caches."""
     prepared, run = Path(prepared).resolve(), Path(run).resolve()
     if prepared.parent != run.parent or prepared == run:
@@ -28,7 +28,7 @@ def collect_files(prepared, run):
     metadata = json.loads((prepared / "prepared.json").read_text())
     config = json.loads((run / "config.json").read_text())
     if (config["count"] != metadata["count"]
-            or Path(config["prepared"]).resolve() != prepared
+            or (not allow_relocated and Path(config["prepared"]).resolve() != prepared)
             or config["prepared_sha256"] != checksum(prepared / "prepared.json")
             or metadata["records_sha256"] != checksum(prepared / "records.json")):
         raise ValueError("Run configuration does not match the prepared data.")
@@ -172,13 +172,16 @@ def upload_file(service, path, parent):
     return remote_id
 
 
-def backup_to_drive(prepared, run, service, *, part_bytes=256 * 1024 * 1024):
+def backup_to_drive(prepared, run, service, *, part_bytes=256 * 1024 * 1024,
+                    allow_relocated=False):
     """Upload bounded parts, then publish the manifest only after every part verifies.
 
     Call the preprocessing pipeline's validate_run() first. Re-running reuses
     verified parts in the same snapshot; it never deletes or mirrors Drive data.
+    allow_relocated permits a read-only backup after a verified local download;
+    it never rewrites the producer configuration or disables content checksums.
     """
-    manifest, files = collect_files(prepared, run)
+    manifest, files = collect_files(prepared, run, allow_relocated=allow_relocated)
     if part_bytes < 1:
         raise ValueError("Archive target size must be positive.")
     manifest["part_target_bytes"] = part_bytes
