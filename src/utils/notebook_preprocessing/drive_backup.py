@@ -175,7 +175,7 @@ def upload_file(service, path, parent):
 
 
 def backup_to_drive(prepared, run, service, *, part_bytes=256 * 1024 * 1024,
-                    allow_relocated=False):
+                    allow_relocated=False, root_id="root"):
     """Upload bounded parts, then publish the manifest only after every part verifies.
 
     Call the preprocessing pipeline's validate_run() first. Re-running reuses
@@ -188,7 +188,8 @@ def backup_to_drive(prepared, run, service, *, part_bytes=256 * 1024 * 1024,
         raise ValueError("Archive target size must be positive.")
     manifest["part_target_bytes"] = part_bytes
     identity = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:20]
-    root = ensure_folder(service, "GRAG preprocessing backups")
+    root = (ensure_folder(service, "GRAG preprocessing backups")
+            if root_id == "root" else root_id)
     snapshot = ensure_folder(service, f"{manifest['dataset']}-{identity}", root)
     manifest["archives"] = []
     with tempfile.TemporaryDirectory(prefix=".drive-backup-", dir=Path(run).parent) as temporary:
