@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import tarfile
 import tempfile
@@ -142,6 +143,38 @@ def ensure_folder(service, name, parent="root"):
     ).execute()["id"]
 
 
+def resolve_folder(service, name, folder_id=None):
+    """Resolve a named root or shortcut to a writable folder without creating roots."""
+    if folder_id is not None:
+        if not isinstance(folder_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", folder_id):
+            raise ValueError("Use a Drive folder or shortcut ID, not a URL.")
+    else:
+        existing = find_remote(service, name, "root")
+        if existing is None:
+            raise FileNotFoundError(f"Drive folder {name} is missing/inaccessible; no replacement was created.")
+        folder_id = existing["id"]
+    seen = set()
+    while folder_id not in seen:
+        seen.add(folder_id)
+        info = service.files().get(
+            fileId=folder_id,
+            fields="id,name,mimeType,trashed,driveId,capabilities(canAddChildren),shortcutDetails(targetId)",
+            supportsAllDrives=True,
+        ).execute()
+        if info.get("trashed"):
+            raise ValueError(f"Drive destination {name} is trashed.")
+        if info["mimeType"] == "application/vnd.google-apps.shortcut":
+            folder_id = info.get("shortcutDetails", {}).get("targetId")
+            if not folder_id:
+                raise ValueError(f"Drive shortcut for {name} has no accessible target ID.")
+            continue
+        if (info["name"] != name or info["mimeType"] != "application/vnd.google-apps.folder"
+                or not info.get("capabilities", {}).get("canAddChildren")):
+            raise ValueError(f"Expected an existing writable Drive folder named {name}.")
+        return info
+    raise ValueError(f"Drive shortcut cycle while resolving {name}.")
+
+
 def upload_media(path):
     from googleapiclient.http import MediaFileUpload
 
@@ -182,14 +215,16 @@ def backup_to_drive(prepared, run, service, *, part_bytes=256 * 1024 * 1024,
     verified parts in the same snapshot; it never deletes or mirrors Drive data.
     allow_relocated permits a read-only backup after a verified local download;
     it never rewrites the producer configuration or disables content checksums.
+    root_id selects the existing GRAG preprocessing backups folder or a shortcut
+    to it. The default retains automatic creation in the caller's My Drive.
     """
     manifest, files = collect_files(prepared, run, allow_relocated=allow_relocated)
     if part_bytes < 1:
         raise ValueError("Archive target size must be positive.")
     manifest["part_target_bytes"] = part_bytes
     identity = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:20]
-    root = (ensure_folder(service, "GRAG preprocessing backups")
-            if root_id == "root" else root_id)
+    root = (ensure_folder(service, "GRAG preprocessing backups") if root_id == "root"
+            else resolve_folder(service, "GRAG preprocessing backups", root_id)["id"])
     snapshot = ensure_folder(service, f"{manifest['dataset']}-{identity}", root)
     manifest["archives"] = []
     with tempfile.TemporaryDirectory(prefix=".drive-backup-", dir=Path(run).parent) as temporary:

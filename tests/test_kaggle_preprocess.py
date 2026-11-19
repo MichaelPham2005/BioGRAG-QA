@@ -275,8 +275,8 @@ class FullGraphTests(unittest.TestCase):
                 return bytes(self)
 
         class NotebookDrive(MutableDrive):
-            def get_media(self, fileId):
-                return Media(super().get_media(fileId))
+            def get_media(self, fileId, **kwargs):
+                return Media(super().get_media(fileId, **kwargs))
 
         class LocalEncoder:
             revision = "a" * 40
@@ -289,6 +289,11 @@ class FullGraphTests(unittest.TestCase):
         checkout = self.root / "checkout"
         self.artifacts.backup_file(self.raw, checkout / "dataset/expla_graphs/train_dev.tsv")
         drive = NotebookDrive()
+        drive.require_all_drives = True
+        drive.entries["shared-backups"] = {
+            "name": "GRAG preprocessing backups", "parents": ["shared-space"],
+            "mimeType": "application/vnd.google-apps.folder", "driveId": "shared-space",
+        }
         store = drive_sync.DriveFolder(drive, "training", self.root / "drive-cache")
         output = checkout / "output/downstream/expla_graphs/full-graph"
         output.mkdir(parents=True)
@@ -320,18 +325,29 @@ class FullGraphTests(unittest.TestCase):
             "COMMIT": "test-code", "requirements": {}, "version": lambda name: "test",
             "backup_to_drive": drive_backup.backup_to_drive, "find_remote": drive_backup.find_remote,
             "restore_drive_snapshot": drive_sync.restore_drive_snapshot,
+            "roots": {"GRAG preprocessing backups": "shared-backups"},
+            "HF_TOKEN": "fixture-token",
         }
         with patch.object(drive_backup, "upload_media", side_effect=lambda path: path), \
                 patch.object(drive_sync, "upload_media", side_effect=lambda path: path), \
                 patch("googleapiclient.http.MediaIoBaseDownload", Download), \
                 patch.object(self.full_graph.preprocessing, "Encoder", LocalEncoder), \
-                patch.object(torch.cuda, "is_available", return_value=True):
+                patch.object(torch.cuda, "is_available", return_value=True), \
+                patch.object(torch.cuda, "get_device_name", return_value="fixture GPU"):
             exec(code, namespace)
             first_hash = namespace["dataset"].config_hash
             self.assertEqual(spawned, [0, 1])
             self.assertEqual(len(namespace["dataset"]), 10)
             receipt = json.loads((store.cache / "preprocessing.json").read_text())
             self.assertEqual(receipt["snapshot_sha256"], namespace["SNAPSHOT_HASH"])
+            self.assertEqual(drive.entries[receipt["snapshot_folder_id"]]["parents"], ["shared-backups"])
+            # Simulate interruption before the receipt: keep local samples, but advance encoder main.
+            (store.cache / "preprocessing.json").unlink()
+            api = unittest.mock.Mock(side_effect=AssertionError("Must reuse the pinned encoder revision"))
+            namespace["HfApi"] = api
+            exec(code, namespace)
+            self.assertEqual(namespace["dataset"].config_hash, first_hash)
+            api.assert_not_called()
             fresh = drive_sync.DriveFolder(drive, "training", self.root / "fresh-cache")
             fresh.download("preprocessing.json")
             namespace.update(DRIVE_OUTPUT=fresh.cache, drive_store=fresh)
@@ -339,6 +355,24 @@ class FullGraphTests(unittest.TestCase):
             exec(code, namespace)
             self.assertEqual(namespace["dataset"].config_hash, first_hash)
             self.assertEqual(namespace["SNAPSHOT_HASH"], receipt["snapshot_sha256"])
+
+    def test_worker_handles_missing_revision_metadata_but_rejects_mismatch(self):
+        encoder = types.SimpleNamespace(revision="b" * 40)
+        with patch.object(self.full_graph.preprocessing, "Encoder", return_value=encoder), \
+                patch.object(torch.cuda, "is_available", return_value=True):
+            with self.assertRaisesRegex(ValueError, "differs from the pinned"):
+                self.full_graph.worker(self.run, 0)
+        encoder_type = type("LocalEncoder", (), {
+            "__init__": lambda self, config, device: None,
+            "__call__": staticmethod(self.encode), "revision": None,
+        })
+        with patch.object(self.full_graph.preprocessing, "Encoder", encoder_type), \
+                patch.object(torch.cuda, "is_available", return_value=True), \
+                patch.object(torch.cuda, "get_device_name", return_value="fixture GPU"):
+            with self.assertWarnsRegex(UserWarning, "did not expose a loaded commit"):
+                self.full_graph.worker(self.run, 0)
+        payload = self.full_graph.preprocessing.load_payload(self.run / "samples/0.pt")
+        self.assertEqual(payload["model_revision"], "a" * 40)
 
 
 class EncoderTests(unittest.TestCase):

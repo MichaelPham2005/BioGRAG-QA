@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import importlib.util
 import io
@@ -31,11 +32,19 @@ class FakeDrive:
         self.entries = {}
         self.uploads = []
         self.fail_upload = None
+        self.require_all_drives = False
+
+    def check_shared_request(self, kwargs, *, listing=False):
+        if self.require_all_drives:
+            assert kwargs.get("supportsAllDrives") is True
+            if listing:
+                assert kwargs.get("includeItemsFromAllDrives") is True
 
     def files(self):
         return self
 
     def list(self, q, **kwargs):
+        self.check_shared_request(kwargs, listing=True)
         name = re.search(r"name = '([^']+)'", q).group(1)
         parent = re.search(r"and '([^']+)' in parents", q).group(1)
         return Request({"files": [
@@ -46,12 +55,17 @@ class FakeDrive:
     def describe(self, key):
         entry = self.entries[key]
         result = {"id": key, "name": entry["name"], "mimeType": entry["mimeType"]}
+        if entry["mimeType"] == "application/vnd.google-apps.folder":
+            result["capabilities"] = {"canAddChildren": True}
+        result.update({name: entry[name] for name in
+                       ("capabilities", "shortcutDetails", "driveId", "trashed") if name in entry})
         if "data" in entry:
             result.update(md5Checksum=hashlib.md5(entry["data"]).hexdigest(),
                           size=str(len(entry["data"])))
         return result
 
     def create(self, body, media_body=None, **kwargs):
+        self.check_shared_request(kwargs)
         if media_body is None:
             key = str(len(self.entries))
             self.entries[key] = dict(body)
@@ -73,6 +87,7 @@ class FakeDrive:
         return Upload()
 
     def get(self, fileId, **kwargs):
+        self.check_shared_request(kwargs)
         return Request(self.describe(fileId))
 
 
@@ -125,6 +140,88 @@ class DriveBackupTests(unittest.TestCase):
 
     def upload(self):
         return backup.backup_to_drive(self.prepared, self.run, self.drive, part_bytes=4096)
+
+    def test_shared_root_shortcut_resolution_and_backup_destination(self):
+        self.drive.require_all_drives = True
+        self.drive.entries.update({
+            "shared-backups": {
+                "name": "GRAG preprocessing backups", "parents": ["shared-space"],
+                "mimeType": "application/vnd.google-apps.folder", "driveId": "shared-space",
+            },
+            "shortcut": {
+                "name": "GRAG preprocessing backups", "parents": ["root"],
+                "mimeType": "application/vnd.google-apps.shortcut",
+                "shortcutDetails": {"targetId": "shared-backups"},
+            },
+        })
+        self.assertEqual(backup.resolve_folder(
+            self.drive, "GRAG preprocessing backups",
+        )["id"], "shared-backups")
+        for folder_id in ("shortcut", "shared-backups"):
+            self.assertEqual(backup.resolve_folder(
+                self.drive, "GRAG preprocessing backups", folder_id,
+            )["id"], "shared-backups")
+        url = backup.backup_to_drive(
+            self.prepared, self.run, self.drive, root_id="shortcut", part_bytes=4096,
+        )
+        self.assertEqual(self.drive.entries[url.rsplit("/", 1)[-1]]["parents"], ["shared-backups"])
+        self.assertEqual(sum(entry["name"] == "GRAG preprocessing backups"
+                             and entry["mimeType"] == "application/vnd.google-apps.folder"
+                             for entry in self.drive.entries.values()), 1)
+
+    def test_shared_root_rejects_bad_names_permissions_shortcuts_and_missing_roots(self):
+        name = "GRAG preprocessing backups"
+        with self.assertRaisesRegex(FileNotFoundError, "no replacement"):
+            backup.resolve_folder(self.drive, name)
+        with self.assertRaisesRegex(ValueError, "not a URL"):
+            backup.resolve_folder(self.drive, name, "https://drive.google.com/folders/x")
+        valid = {"name": name, "parents": ["root"],
+                 "mimeType": "application/vnd.google-apps.folder"}
+        invalid = [
+            {**valid, "name": "common parent"},
+            {**valid, "capabilities": {"canAddChildren": False}},
+            {**valid, "trashed": True},
+            {**valid, "mimeType": "text/plain"},
+            {**valid, "mimeType": "application/vnd.google-apps.shortcut"},
+            {**valid, "mimeType": "application/vnd.google-apps.shortcut",
+             "shortcutDetails": {"targetId": "bad"}},
+        ]
+        for entry in invalid:
+            self.drive.entries = {"bad": entry}
+            with self.subTest(entry=entry), self.assertRaises(ValueError):
+                backup.resolve_folder(self.drive, name, "bad")
+            self.assertEqual(len(self.drive.entries), 1)
+
+    def test_notebook_resolves_both_destination_roots_without_creating_replacements(self):
+        self.drive.require_all_drives = True
+        names = {"preprocessing": "GRAG preprocessing backups", "downstream": "GRAG downstream"}
+        for key, name in names.items():
+            self.drive.entries[key] = {
+                "name": name, "parents": ["shared-space"],
+                "mimeType": "application/vnd.google-apps.folder", "driveId": "shared-space",
+            }
+            self.drive.entries[key + "-shortcut"] = {
+                "name": name, "parents": ["root"],
+                "mimeType": "application/vnd.google-apps.shortcut",
+                "shortcutDetails": {"targetId": key},
+            }
+        notebook = json.loads((ROOT / "notebook/kaggle/grag-expla-graphs-full-graph.ipynb").read_text())
+        cell = next(cell for cell in notebook["cells"] if cell["id"] == "authentication")
+        loop = next(node for node in ast.parse("".join(cell["source"])).body
+                    if isinstance(node, ast.For) and isinstance(node.target, ast.Name)
+                    and node.target.id == "name")
+        code = compile(ast.Module(body=[loop], type_ignores=[]), "<notebook-root-resolution>", "exec")
+        for override in (False, True):
+            namespace = {
+                "service": self.drive, "resolve_folder": backup.resolve_folder, "roots": {},
+                "PREPROCESSING_ROOT_ID": "preprocessing-shortcut" if override else None,
+                "DOWNSTREAM_ROOT_ID": "downstream-shortcut" if override else None,
+                "HttpError": type("HttpError", (Exception,), {}),
+            }
+            with patch("builtins.print"):
+                exec(code, namespace)
+            self.assertEqual(namespace["roots"], {name: key for key, name in names.items()})
+            self.assertEqual(len(self.drive.entries), 4)
 
     def test_round_trip_manifest_exclusions_and_idempotent_retry(self):
         expected, _ = backup.collect_files(self.prepared, self.run)

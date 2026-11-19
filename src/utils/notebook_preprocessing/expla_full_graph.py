@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import warnings
 
 import torch
 from tqdm.auto import tqdm
@@ -120,6 +121,10 @@ def worker(output, shard):
     config_hash = preprocessing.digest(output / "config.json")
     with preprocessing.exclusive_lock(output / f"worker-{shard}.lock"):
         encoder = preprocessing.Encoder(config, "cuda:0")
+        if encoder.revision is not None and encoder.revision != config["model_revision"]:
+            raise ValueError("Loaded encoder revision differs from the pinned commit.")
+        if encoder.revision is None:
+            warnings.warn("Encoder did not expose a loaded commit hash; loading used the pinned model revision.")
         print(
             f"shard={shard} pid={os.getpid()} GPU={torch.cuda.get_device_name(0)} "
             f"pinned_revision={config['model_revision']} "

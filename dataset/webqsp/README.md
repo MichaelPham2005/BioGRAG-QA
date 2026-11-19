@@ -457,10 +457,47 @@ embeddings or accidentally selecting a retrieval backup.
 
 Checkpoints use
 `MyDrive/GRAG downstream/expla_graphs/expla-graphs-full-graph-chat-qlora-kaggle-2t4-<smoke-v1|full-v1>/`.
+For shared destinations, `MyDrive` is replaced by the selected folder's location;
+the names below each root and the checkpoint filenames stay unchanged.
 Existing checkpoint/history/prediction filenames, verified uploads, partial-epoch
 resume and checkpoint-hash evaluation subfolders are reused. Existing retrieval
 runs and WebQSP training helpers are not modified. For evaluation only, run
 sections 1-5, skip training section 6, and run section 7.
+
+### Shared folders, Google Shared Drives, and shortcuts
+
+Section 3 accepts two destination overrides:
+
+- `PREPROCESSING_ROOT_ID`: the existing folder named **GRAG preprocessing backups**.
+- `DOWNSTREAM_ROOT_ID`: the existing folder named **GRAG downstream**.
+
+Use the two root folder IDs, **not** a common parent folder ID, snapshot ID, or
+Drive URL. Either override can also be a shortcut ID; the notebook resolves it
+to the real folder and verifies its name, non-trashed state and permission to add
+children. With both overrides `None`, the notebook discovers folders or shortcuts
+with those exact names directly under the authenticated user's My Drive. Missing
+or duplicate names stop instead of creating replacement root folders.
+
+Each collaborator must authorize their **own** full-Drive OAuth credentials and
+have write access to the actual destination. A shortcut does not grant access.
+Shared Drive requests include the required all-drives flags for listing,
+metadata, downloads (including the completion manifest), uploads and updates.
+The notebook prints the resolved folder URLs and a root-relative run path;
+its local API cache is not a mounted Drive filesystem.
+
+Set a distinct, stable `RUN_OWNER` tag for each collaborator before the first
+run to append it to the run folder name. Leave it empty to retain an existing
+run's name; never change it when resuming that run. Do not run simultaneous
+sessions against the same run folder: checkpoint updates are not multi-writer.
+Preprocessing snapshots remain content-versioned, separate from the run folders.
+
+Interrupted local preprocessing reuses the encoder commit saved in its existing
+`config.json` rather than resolving the latest model revision again. The notebook
+does not patch worker source at runtime. If an older partial run has different
+source fingerprints, preserve its original checkout to resume it or choose a
+fresh preprocessing directory; do not rewrite its configuration hashes.
+Completed snapshots linked by `preprocessing.json` can still be restored without
+rerunning their producer code.
 
 The full configuration uses ten epochs, patience five, batch two and accumulation
 two. `SMOKE_TEST=True` defaults to one epoch on tiny train/val/test subsets; set it
@@ -484,9 +521,11 @@ python -m unittest tests.test_kaggle_preprocess.FullGraphTests tests.test_notebo
 ```
 
 These compare the full graphs/CSV descriptions and splits with the original
-code, verify that long descriptions are retained or explicitly rejected, and
+code, verify that long descriptions are retained or explicitly rejected, resolve
+shared-folder shortcuts, and reject invalid/unwritable destinations. They
 execute the notebook's preprocessing/Drive receipt restore with mocked GPU
-embeddings and Drive. Actual gated 7B NF4 training on two T4s still requires
+embeddings and strict all-drives requests, including interrupted local resume.
+Actual gated 7B NF4 training on two T4s and live shared-folder access still require
 Kaggle validation.
 
 ## Legacy full-cache workflow (reference only)

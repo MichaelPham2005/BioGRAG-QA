@@ -21,11 +21,13 @@ class MutableDrive(FakeDrive):
     def describe(self, key):
         return {**super().describe(key), "parents": self.entries[key]["parents"]}
 
-    def get_media(self, fileId):
+    def get_media(self, fileId, **kwargs):
+        self.check_shared_request(kwargs)
         self.downloads.append(fileId)
         return self.entries[fileId]["data"] + (b"corrupt" if self.corrupt_download else b"")
 
     def update(self, fileId, media_body, **kwargs):
+        self.check_shared_request(kwargs)
         drive = self
 
         class Upload:
@@ -40,6 +42,7 @@ class MutableDrive(FakeDrive):
         return Upload()
 
     def get(self, fileId, **kwargs):
+        self.check_shared_request(kwargs)
         metadata = self.describe(fileId)
         if self.bad_upload_metadata:
             metadata["md5Checksum"] = "invalid"
@@ -60,6 +63,7 @@ class DriveSyncTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.drive = MutableDrive()
+        self.drive.require_all_drives = True
         self.folder = drive_sync.DriveFolder(self.drive, "run-folder", self.root / "cache")
         self.media = patch.object(drive_sync, "upload_media", side_effect=lambda path: path)
         self.downloader = patch("googleapiclient.http.MediaIoBaseDownload", Download)
