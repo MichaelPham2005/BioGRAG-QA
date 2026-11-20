@@ -258,7 +258,7 @@ python -m unittest discover -s tests -p test_drive_backup.py
 
 ## Downstream training on Colab (single T4)
 
-- [ExplaGraphs classification](../../notebook/colab/grag-expla-graphs-downstream.ipynb)
+- [ExplaGraphs classification](../../notebook/colab/grag_expla_graphs_downstream.ipynb)
 - [WebQSP question answering](../../notebook/colab/grag-webqsp-downstream.ipynb)
 - [Shared downstream helpers](../../src/utils/notebook_downstream/)
 
@@ -277,11 +277,50 @@ The source GAT is reused without redesign: its `GATConv` lacks `edge_dim`, so
 modern PyG does not directly include relation embeddings in attention.
 
 Run the default smoke subset first, then set **`SMOKE_TEST=False`** for all retained
-splits. The full default is 3 epochs, microbatch 1, accumulation 4, context budget
-512, description cap 256. Targets are capped at 8 tokens for classification /
-32 for QA, with truncation counts reported. Questions that cannot fit raise an
-error. These settings are conservative starting points, **not a guaranteed T4 fit**
-for arbitrarily large retrieved WebQSP graphs or an exact paper reproduction.
+splits. The WebQSP Colab default remains 3 epochs, microbatch 1, accumulation 4,
+context budget 512, description cap 256 and 32 answer tokens. The updated
+ExplaGraphs untruncated retrieval run uses the settings described below. Questions
+that cannot fit raise an error. These are **not a guaranteed T4 fit** for every
+retrieved graph or an exact paper reproduction.
+
+### ExplaGraphs: retraining without additional text truncation
+
+The [Colab ExplaGraphs notebook](../../notebook/colab/grag_expla_graphs_downstream.ipynb)
+still restores the **existing retrieval-based format-1 Drive snapshot** through
+`CompactTrainingDataset`. Producer paths/hashes, tensors, questions, labels and
+split IDs are retained without rewriting or rerunning the sentence encoder.
+Select the original snapshot explicitly with `SNAPSHOT_NAME` if multiple
+ExplaGraphs backups are present; full-graph snapshots are rejected.
+
+The notebook directly requires untruncated saved retrieval descriptions, with no
+text-limit mode switch. It uses the pinned model's native context (4,096 for
+Llama-2), reserving space for the question, graph token, delimiters and 32 answer
+tokens plus EOS.
+
+It uses **10 total epochs, patience 5, batch 2, accumulation 2, training seed 3**
+and the same QLoRA/GAT/projector settings as the full-graph Kaggle notebook.
+Colab retains single-GPU loading. The full-data length report covers all original
+splits before 7B weight loading, even in smoke mode. The notebook stops if any
+saved description/target would be shortened; it never silently exceeds the
+model's native context. This means no **additional LLM-input truncation**, not
+recovery of source graph data omitted by retrieval/top-k preprocessing.
+
+Run the smoke check first, then use a fresh runtime with `SMOKE_TEST=False`.
+Reuse the **same snapshot and pinned `MODEL_REVISION` SHA** as the old truncated
+run when comparing results, and record any code differences. Drive paths remain
+`MyDrive/GRAG downstream/expla_graphs/`, with separate smoke/full run names
+`expla-graphs-retrieval-chat-qlora-colab-untruncated-<smoke-v1|full-v1>`.
+Old `expla-graphs-chat-qlora-full-v2` checkpoints are untouched. Train fresh
+adapters rather than resuming those weights: their settings differ. Historical
+evaluation/resume sections 10-11 remain available for those original runs.
+
+Long descriptions and batch 2 may not fit one T4. If necessary, use batch 1 /
+accumulation 4 with a new run name, or use a
+larger Colab GPU. Do not reduce the description limit and label it untruncated.
+Compare held-out accuracy/macro-F1 after selecting each best checkpoint by
+validation loss. The historical run also used a different answer cap (8) and
+microbatch/accumulation settings, so its score alone is not a controlled
+truncation-only comparison.
 
 Outputs are automatically backed up to
 `MyDrive/GRAG downstream/<dataset>/<run-name>/`:
@@ -311,8 +350,8 @@ advancing progress. BatchNorm buffers and random state are restored on retries.
 After 16 failed attempts, training raises an error naming affected parameters.
 Clipping remains strict; it never scales invalid gradients into an optimizer
 update. Overflow counts are included in training history. After updating this
-helper, refresh the Colab checkout, restart Python, and use the notebooks' new
-`smoke-v2` / `full-v2` run names rather than overwriting old run fingerprints.
+helper, refresh the Colab checkout, restart Python, and use a fresh run name
+rather than overwriting an old run fingerprint.
 
 ExplaGraphs reports accuracy, macro-F1 and invalid outputs using standalone
 `support`/`counter` words. WebQSP retains the source substring-based metrics and

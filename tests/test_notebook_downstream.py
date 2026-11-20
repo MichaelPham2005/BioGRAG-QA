@@ -363,6 +363,105 @@ class DownstreamTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "every graph to fit intact"):
             exec(check, {"report": {"test": report}})
 
+    def test_colab_retrieval_snapshot_supports_untruncated_text_without_reprocessing(self):
+        from types import SimpleNamespace
+
+        config = {**self.dataset.config, "k": 2, "topk": 20, "topk_entity": 10}
+        artifacts.atomic_json(config, self.run / "config.json")
+        for index in range(len(self.dataset)):
+            path = self.run / "samples" / f"{index}.pt"
+            payload = torch.load(path, weights_only=True)
+            payload.update(config_sha256=artifacts.checksum(self.run / "config.json"), desc="d" * 700)
+            torch.save(payload, path)
+        snapshot = self.snapshot()
+        prepared, run, snapshot_hash = artifacts.restore_snapshot(snapshot, self.root / "colab", "expla_graphs")
+        dataset = artifacts.CompactTrainingDataset(prepared, run)
+        original_config_bytes = (run / "config.json").read_bytes()
+        original_payload_bytes = (run / "samples/0.pt").read_bytes()
+        self.assertEqual(dataset.config["prepared"], "/kaggle/working/old-checkout/output/prepared")
+        self.assertEqual(dataset.get_idx_split(), self.splits)
+        self.assertEqual(dataset[0]["desc"], "d" * 700)
+
+        notebook = json.loads((ROOT / "notebook/colab/grag_expla_graphs_downstream.ipynb").read_text())
+        cells = {cell["id"]: ast.parse("".join(cell["source"]))
+                 for cell in notebook["cells"] if cell["cell_type"] == "code"}
+        retrieval_guard = next(node for node in cells["cell-06"].body if isinstance(node, ast.If)
+                               and "dataset.config" in ast.unparse(node.test))
+        exec(compile(ast.Module(body=[retrieval_guard], type_ignores=[]), "<retrieval-guard>", "exec"),
+             {"dataset": dataset})
+        setting_call = next(node for node in ast.walk(cells["cell-10"]) if isinstance(node, ast.Call)
+                            and isinstance(node.func, ast.Attribute) and node.func.attr == "Settings")
+        run_name = next(node for node in cells["cell-08"].body if isinstance(node, ast.Assign)
+                        and any(isinstance(target, ast.Name) and target.id == "RUN_NAME" for target in node.targets))
+        guard = next(node for node in cells["cell-10"].body if isinstance(node, ast.If)
+                     and "split_report" in ast.unparse(node.test))
+        guard_code = compile(ast.Module(body=[guard], type_ignores=[]), "<no-truncation-guard>", "exec")
+        model = self.tiny_model()
+        model.eval()
+        namespace = {
+            "training": training, "DATASET": "expla_graphs", "MODEL_ID": "local-test",
+            "resolved_revision": "model-sha", "SMOKE_TEST": False,
+            "native_context": 4096,
+        }
+        settings = eval(compile(ast.Expression(setting_call), "<colab-settings>", "eval"), namespace)
+        name_code = compile(ast.Module(body=[run_name], type_ignores=[]), "<run-name>", "exec")
+        exec(name_code, namespace)
+        full_run = namespace["RUN_NAME"]
+        namespace["SMOKE_TEST"] = True
+        exec(name_code, namespace)
+        self.assertNotEqual(full_run, namespace["RUN_NAME"])
+        self.assertNotEqual(full_run, "expla-graphs-chat-qlora-full-v2")
+        output, drive = self.root / full_run, self.root / "drive" / full_run
+        training.initialize_run(settings, dataset, self.splits, snapshot_hash, output, drive)
+        model.settings = settings
+        report = {name: training.token_report(model, dataset, ids) for name, ids in self.splits.items()}
+        exec(guard_code, {"report": report})
+        self.assertEqual(sum(r["descriptions_truncated"] for r in report.values()), 0)
+        samples = artifacts.collate([dataset[0]])
+        inputs = model.input_batch(samples, supervised=True)
+        question = len(model.tokenizer.encode(samples["question"][0]))
+        self.assertEqual(inputs["inputs_embeds"].shape[1], 2 + 1 + 700 + question + 1 + 2)
+        kaggle = json.loads((ROOT / "notebook/kaggle/grag-expla-graphs-full-graph.ipynb").read_text())
+        tree = ast.parse("".join(next(c for c in kaggle["cells"] if c["id"] == "model")["source"]))
+        kaggle_call = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                           and isinstance(node.func, ast.Attribute) and node.func.attr == "Settings")
+        kaggle_settings = eval(compile(ast.Expression(kaggle_call), "<kaggle-settings>", "eval"), {
+            "training": training, "DATASET": "expla_graphs", "MODEL_ID": "local-test",
+            "model_revision": "model-sha", "SMOKE_TEST": False,
+            "config": SimpleNamespace(max_position_embeddings=4096),
+        })
+        self.assertEqual(settings, kaggle_settings)
+        self.assertEqual((run / "config.json").read_bytes(), original_config_bytes)
+        self.assertEqual((run / "samples/0.pt").read_bytes(), original_payload_bytes)
+
+    def test_colab_untruncated_preflight_stops_before_model_load_and_rejects_full_graph(self):
+        from types import SimpleNamespace
+
+        notebook = json.loads((ROOT / "notebook/colab/grag_expla_graphs_downstream.ipynb").read_text())
+        cells = {cell["id"]: ast.parse("".join(cell["source"]))
+                 for cell in notebook["cells"] if cell["cell_type"] == "code"}
+        guard = next(node for node in cells["cell-10"].body if isinstance(node, ast.If)
+                     and "split_report" in ast.unparse(node.test))
+        loads = [node for node in cells["cell-10"].body if isinstance(node, ast.Assign)
+                 and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute)
+                 and node.value.func.attr in ("initialize_run", "load_qlora")]
+        self.assertTrue(all(cells["cell-10"].body.index(guard) < cells["cell-10"].body.index(node)
+                            for node in loads))
+        code = compile(ast.Module(body=[guard, *loads], type_ignores=[]), "<preflight-before-loading>", "exec")
+        for key in ("descriptions_truncated", "answer_targets_truncated"):
+            training_stub = Mock()
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "cannot fit intact"):
+                exec(code, {"report": {"test": {key: 1}},
+                            "training": training_stub})
+            training_stub.initialize_run.assert_not_called()
+            training_stub.load_qlora.assert_not_called()
+        retrieval_guard = next(node for node in cells["cell-06"].body if isinstance(node, ast.If)
+                               and "dataset.config" in ast.unparse(node.test))
+        for config in ({"pipeline": "expla_full_graph"}, {}):
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "original retrieval snapshot"):
+                exec(compile(ast.Module(body=[retrieval_guard], type_ignores=[]), "<retrieval-guard>", "exec"),
+                     {"dataset": SimpleNamespace(config=config)})
+
     def test_newer_best_checkpoint_survives_older_progress_and_retries_backup(self):
         output, drive, _, history = self.fit_scalar(ScalarModel(self.settings), "ahead")
         best = torch.load(output / "best.pt", weights_only=True)
