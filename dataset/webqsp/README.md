@@ -283,7 +283,7 @@ ExplaGraphs untruncated retrieval run uses the settings described below. Questio
 that cannot fit raise an error. These are **not a guaranteed T4 fit** for every
 retrieved graph or an exact paper reproduction.
 
-### ExplaGraphs: retraining without additional text truncation
+### ExplaGraphs: BFS hierarchical hard prompts without text truncation
 
 The [Colab ExplaGraphs notebook](../../notebook/colab/grag_expla_graphs_downstream.ipynb)
 still restores the **existing retrieval-based format-1 Drive snapshot** through
@@ -292,10 +292,29 @@ split IDs are retained without rewriting or rerunning the sentence encoder.
 Select the original snapshot explicitly with `SNAPSHOT_NAME` if multiple
 ExplaGraphs backups are present; full-graph snapshots are rejected.
 
-The notebook directly requires untruncated saved retrieval descriptions, with no
-text-limit mode switch. It uses the pinned model's native context (4,096 for
-Llama-2), reserving space for the question, graph token, delimiters and 32 answer
-tokens plus EOS.
+The notebook now runs a **BFS-only hard-prompt experiment**. Section 4 automatically
+builds the hierarchical text and prints a preview; no flag or CSV mode is needed.
+It reuses the saved centers and reconstructs each ego with the saved hop count,
+checking that node occurrences, directed edge indices and source edge IDs match
+the saved graph exactly. SentenceBERT, retrieval ranking and graph embedding
+generation are not rerun. The soft-prompt graph tensors remain unchanged.
+
+The [BFS text helper](../../src/utils/notebook_downstream/bfs_text.py) constructs
+a BFS tree per ego, then serializes it in preorder with indentation. Traversal
+uses weak adjacency so incoming neighbors can appear beneath their ego root;
+explicit arrows preserve every original edge direction. Non-tree connections,
+self-loops, parallel/repeated edges and any additional components are retained.
+This is a tested implementation of hierarchical graph textualization, not a
+claim that the public `hard_prompt()` helper was used for the published scores.
+
+The descriptions cover **complete retrieved egos**, including facts that might
+have been omitted from the old CSV by `topk_entity`. Thus comparing against an
+old CSV run is not necessarily a pure formatting ablation. A strictly controlled
+format-only comparison would need CSV covering the same complete egos.
+
+The notebook requires all BFS descriptions to fit the pinned model's native
+context (4,096 for Llama-2), reserving space for the question, graph token,
+delimiters and 32 answer tokens plus EOS. No text-limit mode switch is needed.
 
 It uses **10 total epochs, patience 5, batch 2, accumulation 2, training seed 3**
 and the same QLoRA/GAT/projector settings as the full-graph Kaggle notebook.
@@ -303,16 +322,25 @@ Colab retains single-GPU loading. The full-data length report covers all origina
 splits before 7B weight loading, even in smoke mode. The notebook stops if any
 saved description/target would be shortened; it never silently exceeds the
 model's native context. This means no **additional LLM-input truncation**, not
-recovery of source graph data omitted by retrieval/top-k preprocessing.
+recovery of source nodes/edges outside the saved retrieval.
 
 Run the smoke check first, then use a fresh runtime with `SMOKE_TEST=False`.
 Reuse the **same snapshot and pinned `MODEL_REVISION` SHA** as the old truncated
 run when comparing results, and record any code differences. Drive paths remain
 `MyDrive/GRAG downstream/expla_graphs/`, with separate smoke/full run names
-`expla-graphs-retrieval-chat-qlora-colab-untruncated-<smoke-v1|full-v1>`.
+`expla-graphs-retrieval-chat-qlora-colab-untruncated-bfs-complete-egos-<smoke-v1|full-v1>`.
 Old `expla-graphs-chat-qlora-full-v2` checkpoints are untouched. Train fresh
-adapters rather than resuming those weights: their settings differ. Historical
-evaluation/resume sections 10-11 remain available for those original runs.
+adapters rather than resuming CSV weights. The original preprocessing files are
+never rewritten. A backed-up `text-view.json` records the BFS helper hash, source
+configuration and hash of all generated descriptions; the text-view identity
+is included in the run signature.
+
+To start BFS, run sections **1-8**, not the old continuation cell. To resume an
+interrupted BFS run, rerun with the same BFS run name/settings, or use sections
+10-11 with `TRAINING_DRIVE` set to its new folder. Standalone restore rebuilds
+and verifies the exact signed BFS text before loading weights. The default
+historical CSV path in section 10 remains unchanged and still evaluates/resumes
+the original CSV experiment without converting it to BFS.
 
 Long descriptions and batch 2 may not fit one T4. If necessary, use batch 1 /
 accumulation 4 with a new run name, or use a

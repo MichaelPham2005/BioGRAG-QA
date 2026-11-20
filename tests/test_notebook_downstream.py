@@ -1,8 +1,10 @@
 import ast
+from contextlib import redirect_stdout
 from dataclasses import replace
 import io
 import json
 from pathlib import Path
+import re
 import sys
 import tarfile
 import tempfile
@@ -18,7 +20,7 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from src.utils.notebook_downstream import artifacts, training
+from src.utils.notebook_downstream import artifacts, bfs_text, training
 from src.utils.notebook_preprocessing import kaggle_preprocess as preprocessing
 
 
@@ -461,6 +463,151 @@ class DownstreamTests(unittest.TestCase):
             with self.subTest(config=config), self.assertRaisesRegex(ValueError, "original retrieval snapshot"):
                 exec(compile(ast.Module(body=[retrieval_guard], type_ignores=[]), "<retrieval-guard>", "exec"),
                      {"dataset": SimpleNamespace(config=config)})
+
+    def test_bfs_hierarchy_preserves_incoming_cross_parallel_and_self_edges(self):
+        nodes = {0: "root", 1: "left", 2: "right", 3: "join", 4: "isolated"}
+        edges = [
+            (0, 1, "incoming", 0), (1, 0, "branch", 2), (2, 1, "down", 3),
+            (3, 2, "cross", 3), (4, 1, "parallel", 3), (5, 1, "down", 3),
+            (6, 2, "self", 2), (7, 3, "cycle", 1),
+        ]
+        text = bfs_text.hierarchical_description(nodes, edges, 0)
+        self.assertEqual(sorted(map(int, re.findall(r"\[e(\d+)\]", text))), list(range(8)))
+        self.assertIn('  [e0] <--"incoming"-- n1 "left"', text)
+        self.assertIn('    [e2] --"down"--> n3 "join"', text)
+        self.assertLess(text.index("[e2]"), text.index("[e1]"))  # Preorder, not queue order.
+        self.assertIn('[e3] n2 --"cross"--> n3', text)
+        self.assertIn('[e4] n1 --"parallel"--> n3', text)
+        self.assertIn('[e5] n1 --"down"--> n3', text)
+        self.assertIn('[e6] n2 --"self"--> n2', text)
+        self.assertIn('[e7] n3 --"cycle"--> n1', text)
+        self.assertIn('[COMPONENT ROOT] n4 "isolated"', text)
+        self.assertEqual(text, bfs_text.hierarchical_description(nodes, edges, 0))
+
+    def bfs_source(self):
+        triples = [
+            ("a", "r", "b"), ("a", "s", "c"), ("b", "t", "d"),
+            ("c", "u", "d"), ("d", "back", "a"), ("b", "parallel", "d"),
+            ("b", "t", "d"), ("c", "self", "c"),
+        ]
+        nodes, edges = preprocessing.text_tables(triples, "expla_graphs")
+        records = []
+        for index in range(len(self.dataset)):
+            for kind, table in (("nodes", nodes), ("edges", edges)):
+                (self.prepared / kind).mkdir(exist_ok=True)
+                table.to_csv(self.prepared / kind / f"{index}.csv", index=False)
+            records.append({
+                **self.dataset.records[index],
+                **{f"{kind}_sha256": artifacts.checksum(self.prepared / kind / f"{index}.csv")
+                   for kind in ("nodes", "edges")},
+            })
+        artifacts.atomic_json(records, self.prepared / "records.json")
+        metadata = {**self.dataset.metadata,
+                    "records_sha256": artifacts.checksum(self.prepared / "records.json")}
+        artifacts.atomic_json(metadata, self.prepared / "prepared.json")
+        config = {**self.dataset.config, "k": 2, "topk": 20, "topk_entity": 1,
+                  "prepared_sha256": artifacts.checksum(self.prepared / "prepared.json")}
+        artifacts.atomic_json(config, self.run / "config.json")
+        edge_table = edges.reset_index(names="source_edge_id")
+        relations = list(dict.fromkeys(edges.edge_attr))
+        relation_ids = torch.tensor([relations.index(text) for text in edges.edge_attr])
+        for row in records:
+            payload = preprocessing.retrieve_compact(
+                nodes, edge_table, torch.randn(len(nodes), 1024),
+                torch.randn(len(relations), 1024), relation_ids, torch.randn(1024), config,
+            )
+            payload.update(row, config_sha256=artifacts.checksum(self.run / "config.json"),
+                           model_revision="encoder-sha")
+            torch.save(payload, self.run / "samples" / f"{row['id']}.pt")
+        return artifacts.CompactTrainingDataset(self.prepared, self.run)
+
+    def test_bfs_snapshot_reuses_tensors_and_restores_exact_signed_text(self):
+        self.bfs_source()
+        snapshot = self.snapshot()
+        prepared, run, snapshot_hash = artifacts.restore_snapshot(snapshot, self.root / "bfs", "expla_graphs")
+        source = artifacts.CompactTrainingDataset(prepared, run)
+        before = {path: artifacts.checksum(path) for folder in (prepared, run)
+                  for path in folder.rglob("*") if path.is_file()}
+        with patch.object(preprocessing, "Encoder", side_effect=AssertionError("Must not re-embed")):
+            dataset = bfs_text.BFSTrainingDataset(source)
+        original, changed = source.read_payload(0), dataset.read_payload(0)
+        self.assertNotEqual(original["desc"], changed["desc"])
+        for key in original:
+            if isinstance(original[key], torch.Tensor):
+                torch.testing.assert_close(original[key], changed[key], rtol=0, atol=0)
+            elif key != "desc":
+                self.assertEqual(original[key], changed[key])
+        for key in ("x", "edge_index", "edge_attr", "question_node", "question_edge"):
+            torch.testing.assert_close(source[0]["graph"][key], dataset[0]["graph"][key], rtol=0, atol=0)
+        self.assertEqual(dataset.get_idx_split(), source.get_idx_split())
+        self.assertNotEqual(dataset.config_hash, source.config_hash)
+        output, drive = self.root / "bfs-training", self.root / "bfs-drive"
+        signature = training.initialize_run(self.settings, dataset, self.splits, snapshot_hash, output, drive)
+        training.save_and_backup(dataset.text_view, "text-view.json", output, drive)
+        restored = bfs_text.restore_dataset(source, drive / "text-view.json", dataset.config_hash)
+        self.assertEqual(restored.descriptions, dataset.descriptions)
+        self.assertEqual(
+            signature,
+            training.initialize_run(self.settings, restored, self.splits, snapshot_hash, output, drive),
+        )
+        with self.assertRaisesRegex(ValueError, "Choose a new RUN_NAME"):
+            training.initialize_run(self.settings, source, self.splits, snapshot_hash, output, drive)
+        self.assertEqual(before, {path: artifacts.checksum(path) for path in before})
+        for key in ("helper_sha256", "descriptions_sha256"):
+            artifacts.atomic_json({**dataset.text_view, key: "changed"}, drive / "text-view.json")
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "BFS text"):
+                bfs_text.restore_dataset(source, drive / "text-view.json", dataset.config_hash)
+
+    def test_bfs_rejects_reconstruction_that_changes_saved_graph(self):
+        source = self.bfs_source()
+        payload = source.read_payload(0)
+        payload["source_nodes"] = payload["source_nodes"].flip(0)
+        torch.save(payload, self.run / "samples/0.pt")
+        with self.assertRaisesRegex(ValueError, "reconstructed egos differ"):
+            bfs_text.BFSTrainingDataset(source)
+
+    def test_colab_bfs_configuration_and_standalone_restore_use_same_view(self):
+        source = self.bfs_source()
+        notebook = json.loads((ROOT / "notebook/colab/grag_expla_graphs_downstream.ipynb").read_text())
+        cells = {cell["id"]: ast.parse("".join(cell["source"]))
+                 for cell in notebook["cells"] if cell["cell_type"] == "code"}
+        helper_guard = next(node for node in cells["cell-02"].body
+                            if isinstance(node, ast.If) and "bfs_text.py" in ast.unparse(node.test))
+        with self.assertRaisesRegex(FileNotFoundError, "BFS helper is missing"):
+            exec(compile(ast.Module(body=[helper_guard], type_ignores=[]), "<missing-bfs-helper>", "exec"),
+                 {"ROOT": self.root})
+        namespace = {
+            "artifacts": artifacts, "ROOT": self.root, "DATASET": "expla_graphs",
+            "PREPARED": self.prepared, "PREPROCESS_RUN": self.run, "original_splits": self.splits,
+            "json": json, "Path": lambda path: self.root / "drive-root",
+        }
+        with redirect_stdout(io.StringIO()):
+            exec(compile(cells["cell-08"], "<bfs-notebook-config>", "exec"), namespace)
+        dataset = namespace["dataset"]
+        self.assertIsInstance(dataset, bfs_text.BFSTrainingDataset)
+        self.assertIn("bfs-complete-egos", namespace["RUN_NAME"])
+        self.assertFalse((namespace["OUTPUT"] / "last.pt").exists())
+        namespace["DRIVE_OUTPUT"].mkdir(parents=True)
+        receipt = namespace["DRIVE_OUTPUT"] / "text-view.json"
+        artifacts.atomic_json(dataset.text_view, receipt)
+        restore_guard = next(
+            node for node in cells["evaluation-only-setup"].body
+            if isinstance(node, ast.If) and ast.unparse(node.test).startswith("dataset.config_hash !=")
+        )
+        restore_code = compile(ast.Module(body=[restore_guard], type_ignores=[]), "<restore-text-view>", "exec")
+        restore_namespace = {
+            "dataset": source, "TRAINING_DRIVE": namespace["DRIVE_OUTPUT"],
+            "saved_run": {"data_config_sha256": dataset.config_hash},
+        }
+        exec(restore_code, restore_namespace)
+        self.assertEqual(restore_namespace["dataset"].descriptions, dataset.descriptions)
+        receipt.unlink()
+        restore_namespace["dataset"] = source
+        with self.assertRaisesRegex(FileNotFoundError, "text-view.json"):
+            exec(restore_code, restore_namespace)
+        restore_namespace["saved_run"]["data_config_sha256"] = source.config_hash
+        exec(restore_code, restore_namespace)
+        self.assertIs(restore_namespace["dataset"], source)  # Historical CSV runs remain unchanged.
 
     def test_newer_best_checkpoint_survives_older_progress_and_retries_backup(self):
         output, drive, _, history = self.fit_scalar(ScalarModel(self.settings), "ahead")
